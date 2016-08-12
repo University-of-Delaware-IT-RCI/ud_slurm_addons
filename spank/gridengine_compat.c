@@ -6,9 +6,21 @@
  *
  *   - Sets a per-job TMPDIR in the job environment and handles removal of the directory
  *     once the job exits
- *   - Sets some GridEngine per-job environment variables using their SLURM equivalents:
- *        NHOSTS = S_JOB_NCPUS
- *        NSLOTS = S_JOB_NNODES
+ *   - Sets some GridEngine per-job environment variables using their SLURM equivalents
+ *     if the user requested with a flag to sbatch/salloc/run:
+ *
+ *        SGE_O_WORKDIR           = SLURM_SUBMIT_DIR
+ *        JOB_ID                  = SLURM_ARRAY_JOB_ID or SLURM_JOB_ID
+ *        JOB_NAME                = SLURM_JOB_NAME
+ *        NHOSTS                  = SLURM_JOB_NUM_NODES
+ *        NSLOTS                  = SLURM_JOB_CPUS_PER_NODE (evaluated and summed)
+ *        TASK_ID                 = SLURM_ARRAY_TASK_ID
+ *        SGE_TASK_FIRST          = SLURM_ARRAY_TASK_MIN
+ *        SGE_TASK_LAST           = SLURM_ARRAY_TASK_MAX
+ *        SGE_TASK_STEPSIZE       = SLURM_ARRAY_TASK_STEP
+ *
+ *   - Changes the job's working directory to the directory at the time of job
+ *     submission if the user requested with a flag to sbatch/salloc/srun
  *
  */
 
