@@ -24,6 +24,9 @@ all: $(PLUGINS)
 clean::
 	$(RM) $(PLUGINS) *.o
 
+install: $(PLUGINS)
+	cp $(PLUGINS) $(SLURM_LIB)/slurm
+
 #
 
 %.o: %.c
