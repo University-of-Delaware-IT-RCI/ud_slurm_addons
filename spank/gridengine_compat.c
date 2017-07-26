@@ -30,6 +30,7 @@
 #include <fts.h>
 #include <limits.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <slurm/spank.h>
 #include <slurm/slurm.h>
@@ -46,12 +47,6 @@ SPANK_PLUGIN(gridengine_compat, 1)
 static int should_add_sge_env = 0;
 
 /*
- * Should the job start in the working directory from which it was
- * submitted?
- */
-static int should_start_in_submit_wd = 0;
-
-/*
  * @function _opt_add_sge_env
  *
  * Parse the --add-sge-env option.
@@ -63,36 +58,9 @@ static int _opt_add_sge_env(
   int         remote
 )
 {
-  if ( ! remote ) {
-    should_add_sge_env = 1;
-    slurm_verbose("gridengine_compat:  will add SGE-style environment variables to job");
-  } else {
-    slurm_error("gridengine_compat: cannot use --add-sge-env option in this context");
-    return (-1);
-  }
-  return (0);
-}
-
-/*
- * @function _opt_cwd
- *
- * Parse the --cwd option.
- *
- */
-static int _opt_cwd(
-  int         val,
-  const char  *optarg,
-  int         remote
-)
-{
-  if ( ! remote ) {
-    should_start_in_submit_wd = 1;
-    slurm_verbose("gridengine_compat:  will set job working directory to that from which job was submitted");
-  } else {
-    slurm_error("gridengine_compat: cannot use --cwd option in this context");
-    return (-1);
-  }
-  return (0);
+  should_add_sge_env = 1;
+  slurm_verbose("gridengine_compat:  will add SGE-style environment variables to job");
+  return 0;
 }
 
 /*
@@ -103,11 +71,51 @@ struct spank_option spank_options[] =
     { "add-sge-env", NULL,
       "Add GridEngine equivalents of SLURM job environment variables.",
       0, 0, (spank_opt_cb_f) _opt_add_sge_env },
-    { "cwd", NULL,
-      "Start the job in the same working directory from which it was submitted.",
-      0, 0, (spank_opt_cb_f) _opt_cwd },
     SPANK_OPTIONS_TABLE_END
 };
+
+
+int
+_get_tmpdir(
+  spank_t         spank,
+  char            *outTmpDir,
+  size_t          outTmpDirLen
+)
+{
+  uint32_t      job_id = 0;
+  uint32_t      job_step_id = 0;
+  const char    *tmpdir = NULL;
+  const char    *tmpdir_format = NULL;
+  int           actual_len = 0;
+  
+  /* Get the job id and step id: */
+  if ( spank_get_item(spank, S_JOB_ID, &job_id) != ESPANK_SUCCESS ) {
+    slurm_error("gridengine_compat: no job id associated with job??");
+    return (-1);
+  }
+  if ( spank_get_item(spank, S_JOB_STEPID, &job_step_id) != ESPANK_SUCCESS ) {
+    slurm_error("gridengine_compat: no step id associated with job %u??", job_id);
+    return (-1);
+  }
+  
+  /* Default to /tmp if SLURM doesn't have TMPDIR set in the environment: */
+  if ( (tmpdir = getenv ("TMPDIR")) == NULL ) tmpdir = "/tmp";
+  
+  /* Decide which format the directory should use and determine string length: */
+  if ( job_step_id == SLURM_BATCH_SCRIPT ) {
+    tmpdir_format = "%s/%u";
+  } else {
+    tmpdir_format = "%s/%u.%u";
+  }
+  actual_len = snprintf(outTmpDir, outTmpDirLen, tmpdir_format, tmpdir, job_id, job_step_id);
+  
+  /* If the snprintf() failed then we've got big problems: */
+  if ( (actual_len < 0) || (actual_len >= outTmpDirLen) ) {
+    slurm_error("gridengine_compat: Failure while creating new tmpdir path: %d", actual_len);
+    return (-1);
+  }
+  return actual_len;
+}
 
 
 int
@@ -195,6 +203,57 @@ _rmdir_recurse(
 
 
 /*
+ * @function slurm_spank_init
+ *
+ * In the ALLOCATOR context, the 'spank_options' don't get automatically
+ * registered as they do under LOCAL and REMOTE.  So under that context
+ * we explicitly register our cli options.
+ *
+ */
+int
+slurm_spank_init(
+  spank_t       spank_ctxt,
+  int           argc,
+  char          *argv[]
+)
+{
+  int                     rc = ESPANK_SUCCESS;
+  int                     i;
+  
+  if ( spank_context() == S_CTX_ALLOCATOR ) {
+    struct spank_option   *o = spank_options;
+    
+    while ( o->name && (rc == ESPANK_SUCCESS) ) rc = spank_option_register(spank_ctxt, o++);
+  }
+  
+  for ( i = 0; i < argc; i++ ) {
+    if ( strncmp("enable=", argv[i], 7) == 0 ) {
+      const char          *optarg = argv[i] + 7;
+      
+      if ( isdigit(*optarg) ) {
+        char              *e;
+        long              v = strtol(optarg, &e, 10);
+        
+        if ( e > optarg && ! *e ) {
+          if ( v ) should_add_sge_env = 1;
+        } else {
+          slurm_error("gridengine_compat: Ignoring invalid enable option: %s", argv[i]);
+        }
+      } else if ( ! strcasecmp(optarg, "y") || ! strcasecmp(optarg, "yes") || ! strcasecmp(optarg, "t") || ! strcasecmp(optarg, "true") ) {
+        should_add_sge_env = 1;
+      } else if ( strcasecmp(optarg, "n") && strcasecmp(optarg, "no") && strcasecmp(optarg, "f") && strcasecmp(optarg, "false") ) {
+        slurm_error("gridengine_compat: Ignoring invalid enable option: %s", argv[i]);
+      }
+    } else {
+      slurm_error("gridengine_compat: Invalid option: %s", argv[i]);
+    }
+  }
+  
+  return rc;
+}
+
+
+/*
  * @function slurm_spank_local_user_init
  *
  * Set job-specific TMPDIR in environment.  For batch scripts the path
@@ -209,59 +268,20 @@ _rmdir_recurse(
  */
 int
 slurm_spank_local_user_init(
-  spank_t       spank,
-  int           ac,
+  spank_t       spank_ctxt,
+  int           argc,
   char          *argv[]
 )
 {
-  uint32_t      job_id = 0;
-  uint32_t      job_step_id = 0;
-  const char    *tmpdir = NULL;
-  const char    *tmpdir_format = NULL;
-  int           newtmpdir_len = 0;
+  char          tmpdir[PATH_MAX];
+  int           tmpdirlen = _get_tmpdir(spank_ctxt, tmpdir, sizeof(tmpdir));
   
-  /* Get the job id and step id: */
-  if ( spank_get_item(spank, S_JOB_ID, &job_id) != ESPANK_SUCCESS ) {
-    slurm_error("gridengine_compat: no job id associated with job??");
-    return (-1);
-  }
-  if ( spank_get_item(spank, S_JOB_STEPID, &job_step_id) != ESPANK_SUCCESS ) {
-    slurm_error("gridengine_compat: no step id associated with job %u??", job_id);
-    return (-1);
-  }
-  
-  /* Default to /tmp if SLURM doesn't have TMPDIR set in the environment: */
-  if ( (tmpdir = getenv ("TMPDIR")) == NULL ) tmpdir = "/tmp";
-  
-  /* Decide which format the directory should use and determine string length: */
-  if ( job_step_id == SLURM_BATCH_SCRIPT ) {
-    tmpdir_format = "%s/%u";
-  } else {
-    tmpdir_format = "%s/%u.%u";
-  }
-  newtmpdir_len = snprintf(NULL, 0, tmpdir_format, tmpdir, job_id, job_step_id);
-  
-  /* If the snprintf() failed then we've got big problems: */
-  if ( newtmpdir_len < 0 ) {
-    slurm_error("gridengine_compat: Failure while creating new tmpdir path: %d", newtmpdir_len);
-    return (-1);
-  } else {
-    char        newtmpdir[newtmpdir_len + 1];
-    
-    /* Create the TMPDIR string: */
-    newtmpdir_len = snprintf(newtmpdir, sizeof(newtmpdir), tmpdir_format, tmpdir, job_id, job_step_id);
-    if ( newtmpdir_len < 0 ) {
-      slurm_error("gridengine_compat: Failure while creating new tmpdir path: %d", newtmpdir_len);
+  if ( tmpdirlen > 0 ) {
+    if ( setenv("TMPDIR", tmpdir, 1) < 0 ) {
+      slurm_error("setenv(TMPDIR, \"%s\"): %m", tmpdir);
       return (-1);
     }
-    
-    /* Set the TMPDIR variable in the current environment: */
-    if ( setenv("TMPDIR", newtmpdir, 1) < 0 ) {
-      slurm_error("setenv(TMPDIR, \"%s\"): %m", newtmpdir);
-      return (-1);
-    }
-    
-    slurm_verbose("gridengine_compat: TMPDIR = %s", newtmpdir);
+    slurm_verbose("gridengine_compat: TMPDIR = %s", tmpdir);
   }
   return (0);
 }
@@ -282,18 +302,6 @@ slurm_spank_task_init(
 )
 {
   char          value[8192];
-  
-  if ( spank_remote(spank_ctxt) && should_start_in_submit_wd ) {
-    if ( spank_getenv(spank_ctxt, "SLURM_SUBMIT_DIR", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
-      if ( ! chdir(value) ) {
-        slurm_error("gridengine_compat: slurm_spank_task_init: Unable to change working directory (%d: %s)", errno, strerror(errno));
-        return (-1);
-      }
-    } else {
-      slurm_error("gridengine_compat: slurm_spank_task_init: Unable to change working directory (SLURM_SUBMIT_DIR not set)");
-      return (-1);
-    }
-  }
   
   if ( spank_remote(spank_ctxt) && should_add_sge_env ) {
     
@@ -345,12 +353,13 @@ slurm_spank_task_init(
             p = e;
           }
           nslots += n;
-          
-          if ( *p == ',' ) {
-            p++;
-          } else {
-            slurm_error("gridengine_compat: slurm_spank_task_init: Unable to parse SLURM_JOB_CPUS_PER_NODE (at index %ld): %s", (p - value), value);
-            break;
+          if ( *p ) {
+            if ( *p == ',' ) {
+              p++;
+            } else {
+              slurm_error("gridengine_compat: slurm_spank_task_init: Unable to parse SLURM_JOB_CPUS_PER_NODE (at index %ld): %s", (p - value), value);
+              break;
+            }
           }
         } else {
           slurm_error("gridengine_compat: slurm_spank_task_init: Unable to parse SLURM_JOB_CPUS_PER_NODE (at index %ld): %s", (p - value), value);
@@ -389,25 +398,27 @@ slurm_spank_exit(
 )
 {
   if ( spank_remote(spank_ctxt) ) {
-    char        tmpdir[PATH_MAX];
-    uid_t       jobUid = -1;
+    char            tmpdir[PATH_MAX];
     
-    if ( spank_getenv(spank_ctxt, "TMPDIR", tmpdir, sizeof(tmpdir)) != ESPANK_SUCCESS ) {
-      slurm_error("gridengine_compat: Unable to remove TMPDIR at exit (no TMPDIR in job environment)");
-      return (-1);
+    if ( spank_getenv(spank_ctxt, "TMPDIR", tmpdir, sizeof(tmpdir)) == ESPANK_SUCCESS) {
+      uid_t         jobUid = -1;
+      struct stat   finfo;
+
+      if (spank_get_item (spank_ctxt, S_JOB_UID, &jobUid) != ESPANK_SUCCESS) {
+        slurm_error ("gridengine_compat: unable to get job's user id");
+        return (-1);
+      }
+      
+      if ( (stat(tmpdir, &finfo) == 0) && S_ISDIR(finfo.st_mode) ) {
+        if ( ! _rmdir_recurse(tmpdir, jobUid) ) {
+          slurm_error("gridengine_compat: Unable to remove TMPDIR at exit (failure in _rmdir_recurse(%s,%d))", tmpdir, jobUid);
+          return (-1);
+        }
+        slurm_verbose("gridengine_compat: rm -rf %s", tmpdir);
+      } else {
+        slurm_error("gridengine_compat:  failed stat check of %s (uid = %d, st_mode = %x, errno = %d)", tmpdir, jobUid, finfo.st_mode, errno);
+      }
     }
-    
-    if (spank_get_item (spank_ctxt, S_JOB_UID, &jobUid) != ESPANK_SUCCESS) {
-      slurm_error("gridengine_compat: Unable to remove TMPDIR at exit (failed to get job's user id)");
-      return (-1);
-    }
-    
-    if ( ! _rmdir_recurse(tmpdir, jobUid) ) {
-      slurm_error("gridengine_compat: Unable to remove TMPDIR at exit (failure in _rmdir_recurse())");
-      return (-1);
-    }
-    
-    slurm_verbose("gridengine_compat: rm -rf %s", tmpdir);
   }
   return (0);
 }
