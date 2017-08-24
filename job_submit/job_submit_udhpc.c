@@ -13,15 +13,23 @@
 /*
  * Plugin identity and versioning info:
  */
+#ifndef PLUGIN_SUBTYPE
+# define PLUGIN_SUBTYPE "udhpc"
+#endif
 const char plugin_name[]        = "Job submit UD HPC conventions plugin";
-const char plugin_type[]        = "job_submit/udhpc";
+const char plugin_type[]        = "job_submit/" PLUGIN_SUBTYPE;
 const uint32_t plugin_version   = SLURM_VERSION_NUMBER;
 
 
 #ifndef UDHPC_BASE_GID
-# define UDHPC_BASE_GID         1001
+# define UDHPC_BASE_GID         500
 #endif
 const gid_t udhpc_base_gid = UDHPC_BASE_GID;
+
+#ifndef UDHPC_MIN_MEM_MB
+# define UDHPC_MIN_MEM_MB       1024
+#endif
+const uint64_t udhcp_min_mem_mb = UDHPC_MIN_MEM_MB;
 
 
 char*
@@ -76,7 +84,11 @@ job_submit(
   char                    **err_msg
 )
 {
-  
+  /* Memory limit _must_ be set: */
+  if ( (job_desc->pn_min_memory <= 0) || (job_desc->pn_min_memory == NO_VAL64) ) {
+    job_desc->pn_min_memory = udhcp_min_mem_mb;
+    info(PLUGIN_SUBTYPE ": setting default memory limit (%lu MiB)", udhcp_min_mem_mb);
+  }
   
   /* Set the job account to match the submission group: */
   if ( ! job_desc->account ) {
@@ -88,9 +100,9 @@ job_submit(
       
       if ( submit_gname ) {
         job_desc->account = submit_gname;
-        info("Setting job account to %s (%u)", submit_gname, submit_gid);
+        info(PLUGIN_SUBTYPE ": setting job account to %s (%u)", submit_gname, submit_gid);
       } else {
-        info("Unable to resolve job submission gid %u; job account not set", submit_gid);
+        info(PLUGIN_SUBTYPE ": unable to resolve job submission gid %u; job account not set", submit_gid);
         if ( err_msg ) {
           *err_msg = xstrdup_printf("Unable to resolve job submission gid %u", submit_gid);
         }
@@ -118,7 +130,7 @@ job_modify(
 {
   /* We do not allow the job account to change: */
   if ( job_desc->account && (! job_ptr->account || xstrcasecmp(job_desc->account, job_ptr->account)) ) {
-    info("Job account cannot be modified after submission");
+    info(PLUGIN_SUBTYPE ": job account cannot be modified after submission");
     return SLURM_ERROR;
   }
   return SLURM_SUCCESS;
