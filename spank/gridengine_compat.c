@@ -343,6 +343,12 @@ slurm_spank_task_init(
     }
     
     /*
+     * We will not setup a PE_HOSTFILE, since doing so could cause tightly-integrated
+     * MPI implementations (like Open MPI) to mistakenly think that we're actually
+     * using Grid Engine.
+     */
+    
+    /*
      * Hmm...how do we calculate NSLOTS for a job step?  Looks like the
      * best bet is SLURM_JOB_CPUS_PER_NODE, which is a comma-delimited list
      * of integers with optional repeat counts:
