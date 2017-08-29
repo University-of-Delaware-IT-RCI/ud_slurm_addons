@@ -302,15 +302,39 @@ slurm_spank_task_init(
 )
 {
   char          value[8192];
+  int           did_set_nslots = 0;
   
   if ( spank_remote(spank_ctxt) && should_add_sge_env ) {
     
+    if ( spank_getenv(spank_ctxt, "SLURM_CLUSTER_NAME", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_CLUSTER_NAME", value, 1);
+    
     if ( spank_getenv(spank_ctxt, "SLURM_SUBMIT_DIR", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_O_WORKDIR", value, 1);
     
-    if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_JOB_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "JOB_ID", value, 1);
-    else if ( spank_getenv(spank_ctxt, "SLURM_JOB_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "JOB_ID", value, 1);
+    if ( spank_getenv(spank_ctxt, "SLURM_SUBMIT_HOST", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_O_HOST", value, 1);
     
-    if ( spank_getenv(spank_ctxt, "SLURM_JOB_NAME", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "JOB_NAME", value, 1);
+    if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_JOB_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+      spank_setenv(spank_ctxt, "JOB_ID", value, 1);
+    
+      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_ID", value, 1);
+      
+      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_MIN", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_FIRST", value, 1);
+      
+      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_MAX", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_LAST", value, 1);
+      
+      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_STEP", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_STEPSIZE", value, 1);
+    }
+    else if ( spank_getenv(spank_ctxt, "SLURM_JOB_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+      spank_setenv(spank_ctxt, "JOB_ID", value, 1);
+    }
+    
+    if ( spank_getenv(spank_ctxt, "SLURM_JOB_NAME", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+      spank_setenv(spank_ctxt, "JOB_NAME", value, 1);
+    } else {
+      spank_setenv(spank_ctxt, "JOB_NAME", "STDIN", 1);
+    }
+    
+    if ( spank_getenv(spank_ctxt, "SLURM_JOB_PARTITION", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "QUEUE", value, 1);
+    spank_setenv(spank_ctxt, "NQUEUES", "1", 1);
     
     if ( spank_getenv(spank_ctxt, "SLURM_JOB_NUM_NODES", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
       spank_setenv(spank_ctxt, "NHOSTS", value, 1);
@@ -368,16 +392,12 @@ slurm_spank_task_init(
       }
       if ( (nslots > 0) && (snprintf(value, sizeof(value), "%u", nslots) > 0) ) {
         spank_setenv(spank_ctxt, "NSLOTS", value, 1);
+        did_set_nslots = 1;
       }
     }
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "TASK_ID", value, 1);
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_MIN", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_FIRST", value, 1);
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_MAX", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_LAST", value, 1);
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_STEP", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_STEPSIZE", value, 1);
+    if ( ! did_set_nslots ) {
+      spank_setenv(spank_ctxt, "NSLOTS", "1", 1);
+    }
   }
   return (0);
 }
