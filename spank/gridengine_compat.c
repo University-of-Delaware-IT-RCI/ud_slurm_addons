@@ -329,8 +329,6 @@ slurm_spank_task_init(
     
     if ( spank_getenv(spank_ctxt, "SLURM_JOB_NAME", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
       spank_setenv(spank_ctxt, "JOB_NAME", value, 1);
-    } else {
-      spank_setenv(spank_ctxt, "JOB_NAME", "STDIN", 1);
     }
     
     if ( spank_getenv(spank_ctxt, "SLURM_JOB_PARTITION", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "QUEUE", value, 1);
