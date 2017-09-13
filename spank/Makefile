@@ -2,7 +2,7 @@
 # Makefile for UD SLURM SPANK plugins
 #
 
-SLURM_PREFIX		= /opt/shared/slurm/current
+SLURM_PREFIX		= /opt/shared/slurm/17.02.7
 SLURM_INCLUDE		= $(SLURM_PREFIX)/include
 SLURM_LIB		= $(SLURM_PREFIX)/lib
 

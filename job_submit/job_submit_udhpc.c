@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <grp.h>
 #include <ctype.h>
+#include <math.h>
 
 #include "slurm/slurm_errno.h"
 #include "src/common/slurm_xlator.h"
@@ -31,7 +32,7 @@ const gid_t udhpc_base_gid = UDHPC_BASE_GID;
 #ifndef UDHPC_MIN_MEM_MB
 # define UDHPC_MIN_MEM_MB       1024
 #endif
-const uint64_t udhcp_min_mem_mb = UDHPC_MIN_MEM_MB;
+const uint64_t udhpc_min_mem_mb = UDHPC_MIN_MEM_MB;
 
 
 char*
@@ -72,6 +73,69 @@ job_submit_udhpc_getgrgid(
     xfree(gid_str_buffer);
   }
   return out_gname;
+}
+
+
+extern int
+job_submit_strncasecmp(
+  const char    *s1,
+  const char    *s2,
+  size_t        l
+)
+{
+  while ( l-- ) {
+    if ( *s1 && *s2 ) {
+      if (tolower(*s1) != tolower(*s2)) return (tolower(*s2) - tolower(*s1));
+      s1++; s2++;
+    } else {
+      if ( *s1 != *s2 ) return (tolower(*s2) - tolower(*s1));
+      break;
+    }
+  }
+  return 0;
+}
+
+
+static inline int
+job_submit_resource_name_equal(
+  const char    *s,
+  size_t        l,
+  const char    *d
+)
+{
+  return (job_submit_strncasecmp(s, d, l) == 0) ? 1 : 0;
+}
+
+
+static inline int
+job_submit_resource_name_in_pair(
+  const char    *s,
+  size_t        l,
+  const char    *d1,
+  const char    *d2
+)
+{
+  if ( job_submit_strncasecmp(s, d1, l) == 0 ) return 1;
+  return (job_submit_strncasecmp(s, d2, l) == 0) ? 1 : 0;
+}
+
+
+static inline int
+job_submit_resource_name_in_set(
+  const char    *s,
+  size_t        l,
+  ...
+)
+{
+  va_list       vargs;
+  const char    *d;
+  
+  va_start(vargs, l);
+  while ( (d = va_arg(vargs, const char*)) ) {
+    if ( job_submit_strncasecmp(s, d, l) == 0 ) return 1;
+  }
+  va_end(vargs);
+  return 0;
 }
 
 
@@ -168,6 +232,195 @@ retry:
 
 
 extern int
+job_submit_sge_parse_memory(
+  const char            *s,
+  size_t                l,
+  uint64_t              *megabytes
+)
+{
+  if ( l > 0 ) {
+    char                S[l + 1];
+    char                *e;
+    long long           v;
+    
+    memcpy(S, s, l);
+    S[l] = '\0';
+    s = &S[0];
+    
+    debug3(PLUGIN_SUBTYPE ": parse memory: [%s]", S);
+    
+    /* Attempt to scan an integer value: */
+    v = strtoll(s, &e, 0);
+    if ( (v >= 0) && (e > s) ) {
+      switch ( *e ) {
+        case 'G':
+          v *= 1024;
+        case 'M':
+          v *= 1024;
+        case 'K':
+          v *= 1024;
+          break;
+          
+        case 'g':
+          v *= 1000;
+        case 'm':
+          v *= 1000;
+        case 'k':
+          v *= 1000;
+          break;
+      
+      }
+      /* Convert to MiB: */
+      v = (v / 1048576) + ((v %1048576) ? 1 : 0);
+      
+      if ( (v > 0) && (v < udhpc_min_mem_mb) ) v = udhpc_min_mem_mb;
+      *megabytes = v;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+extern int
+job_submit_sge_parse_time(
+  const char            *s,
+  size_t                l,
+  uint32_t              *minutes
+)
+{
+  if ( l > 0 ) {
+    char                S[l + 1];
+    double              seconds;
+    char                *e;
+    long                v, t[3] = { 0, 0, 0 };
+    
+    memcpy(S, s, l);
+    S[l] = '\0';
+    s = &S[0];
+    
+    debug3(PLUGIN_SUBTYPE ": parse time: [%s]", S);
+    
+    /* Attempt to scan an integer value: */
+    v = strtol(s, &e, 0);
+    
+    /* If *e is a colon, this is a full time spec: */
+    if ( *e == ':' ) {
+      t[0] = (e > s) ? v : 0;
+      v = strtol((s = e + 1), &e, 0);
+      if ( *e != ':' ) return 0;
+      t[1] = (e > s) ? v : 0;
+      v = strtol((s = e + 1), &e, 0);
+      t[2] = (e > s) ? v : 0;
+    } else {
+      /* Seconds only: */
+      t[2] = (e > s) ? v : 0;
+    }
+    
+    /* Total the seconds: */
+    seconds = t[2] + 60 * (t[1] + 60 * t[0]);
+    if ( seconds >= 0.0 ) {
+      seconds = ceil(seconds / 60.0);
+      if ( seconds < UINT32_MAX ) {
+        debug3(PLUGIN_SUBTYPE ": => %f minutes", seconds);
+        *minutes = (uint32_t)seconds;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+
+extern int
+job_submit_sge_parse_int(
+  const char            *s,
+  size_t                l,
+  long                  *value
+)
+{
+  if ( l > 0 ) {
+    char                S[l + 1];
+    char                *e;
+    long                v;
+    
+    memcpy(S, s, l);
+    S[l] = '\0';
+    s = &S[0];
+    
+    debug3(PLUGIN_SUBTYPE ": parse int: [%s]", S);
+    
+    /* Attempt to scan an integer value: */
+    v = strtol(s, &e, 0);
+    if ( e > s ) {
+      *value = v;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+typedef enum {
+  kSGEBooleanNoValue = -1,
+  kSGEBooleanFalse = 0,
+  kSGEBooleanTrue = 1
+} sge_bool_t;
+
+extern int
+job_submit_sge_parse_bool(
+  const char            *s,
+  size_t                l,
+  sge_bool_t            *value
+)
+{
+  if ( l > 0 ) {
+    /* Allowed values are TRUE, FALSE, 1, 0: */
+    switch ( *s ) {
+    
+      case 'T':
+      case 't': {
+        ++s, l--; if ( (l == 0) || ! *s || ((*s != 'r') && (*s != 'R')) ) return 0;
+        ++s, l--; if ( (l == 0) || ! *s || ((*s != 'u') && (*s != 'U')) ) return 0;
+        ++s, l--; if ( (l == 0) || ! *s || ((*s != 'e') && (*s != 'E')) ) return 0;
+        if ( --l == 0 ) {
+          *value = kSGEBooleanTrue;
+          return 1;
+        }
+        break;
+      }
+    
+      case 'F':
+      case 'f': {
+        ++s, l--; if ( (l == 0) || ! *s || ((*s != 'a') && (*s != 'A')) ) return 0;
+        ++s, l--; if ( (l == 0) || ! *s || ((*s != 'l') && (*s != 'L')) ) return 0;
+        ++s, l--; if ( (l == 0) || ! *s || ((*s != 's') && (*s != 'S')) ) return 0;
+        ++s, l--; if ( (l == 0) || ! *s || ((*s != 'e') && (*s != 'E')) ) return 0;
+        if ( --l == 0 ) {
+          *value = kSGEBooleanFalse;
+          return 1;
+        }
+        break;
+      }
+      
+      case '1': {
+        ++s; l--; if ( l > 0 ) return 0;
+        *value = kSGEBooleanTrue;
+        return 1;
+      }
+      
+      case '0': {
+        ++s; l--; if ( l > 0 ) return 0;
+        *value = kSGEBooleanFalse;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+
+extern int
 job_submit_sge_parser(
   struct job_descriptor   *job_desc,
   char                    **err_msg
@@ -210,22 +463,12 @@ job_submit_sge_parser(
             /* We only apply these options if they haven't already
              * been chosen on the CLI.
              */
-            if ( (job_desc->num_tasks == NO_VAL) ||
-                 (job_desc->cpus_per_task == NO_VAL16) ||
-                 (job_desc->min_cpus == 1) ||
-                 (job_desc->max_cpus == NO_VAL) ||
-                 (job_desc->min_nodes == NO_VAL) ||
-                 (job_desc->max_nodes == NO_VAL) ||
-                 (job_desc->ntasks_per_node == NO_VAL16) ||
-                 (job_desc->ntasks_per_socket == NO_VAL16) ||
-                 (job_desc->ntasks_per_core == NO_VAL16) ||
-                 (job_desc->ntasks_per_board == 0) ||
-                 (job_desc->pn_min_cpus == NO_VAL16)
+            if ( (job_desc->min_cpus == 1) &&
+                 (job_desc->max_cpus == NO_VAL)
               )
             {
-              bool        is_checking_max = false;
-              uint32_t    min_cpus = 1;
-              uint32_t    max_cpus = NO_VAL;
+              int         index = 0;
+              uint32_t    cpu_range[2] = { 1, NO_VAL };
               
               debug3(PLUGIN_SUBTYPE ": -pe option found");
               
@@ -243,36 +486,40 @@ job_submit_sge_parser(
                */
               if ( *s == '-' ) {
                 s++;
-                is_checking_max = true;
+                index = 1;
               }
               
               /* If the next word looks like a number, then proceed: */
               if ( *s && (*s != '\n') && isdigit(*s) ) {
                 long        v;
                 
-next_number:
-                v = strtol(s, &e, 10);
+next_number:    v = strtol(s, &e, 10);
                 if ( v && (e > s) ) {
-                  /* Which value are we setting? */
-                  if ( is_checking_max ) {
-                    if ( v > 0 && v <= NO_VAL ) max_cpus = v;
-                  } else {
-                    if ( v > 0 && v <= NO_VAL ) min_cpus = v;
-                    /* Now:  if the character we ended on is a dash, then this is probably a
-                     * range and we should check the next word, too:
-                     */
-                    is_checking_max = true;
-                    if ( *e++ == '-') {
-                      if ( isdigit(*e) ) {
-                        s = e;
-                        goto next_number;
-                      } else {
-                        if ( err_msg ) {
-                          *err_msg = xstrdup_printf("invalid slot count at line %ld of job script", line_no);
+                  if ( v > 0 && v <= NO_VAL ) {
+                    cpu_range[index] = v;
+                    
+                    /* Which value are we setting? */
+                    if ( index++ == 0 ) {
+                      /* Now:  if the character we ended on is a dash, then this is probably a
+                       * range and we should check the next word, too:
+                       */
+                      if ( *e++ == '-') {
+                        if ( isdigit(*e) ) {
+                          s = e;
+                          goto next_number;
+                        } else {
+                          if ( err_msg ) {
+                            *err_msg = xstrdup_printf("invalid slot count at line %ld of job script", line_no);
+                          }
+                          return SLURM_ERROR;
                         }
-                        return SLURM_ERROR;
                       }
                     }
+                  } else {
+                    if ( err_msg ) {
+                      *err_msg = xstrdup_printf("invalid slot count (%ld) at line %ld of job script", v, line_no);
+                    }
+                    return SLURM_ERROR;
                   }
                 } else {
                   if ( err_msg ) {
@@ -280,14 +527,14 @@ next_number:
                   }
                   return SLURM_ERROR;
                 }
-                if ( min_cpus <= max_cpus ) {
-                  /* Set the total CPU count: */
-                  job_desc->min_cpus = min_cpus;
-                  job_desc->max_cpus = max_cpus;
-                  info(PLUGIN_SUBTYPE ": cpu settings from -pe option => cpu range %u-%u", min_cpus, max_cpus);
+                if ( cpu_range[0] <= cpu_range[1] ) {
+                  /* Set the task count and cpus per task: */
+                  job_desc->min_cpus = cpu_range[0];
+                  job_desc->max_cpus = cpu_range[1];
+                  info(PLUGIN_SUBTYPE ": cpu count constraints from -pe option => cpu range %u-%u", job_desc->min_cpus, job_desc->max_cpus);
                 } else {
                   if ( err_msg ) {
-                    *err_msg = xstrdup_printf("slot minimum (%u) > maximum (%u) at line %ld of job script", min_cpus, max_cpus, line_no);
+                    *err_msg = xstrdup_printf("slot minimum (%u) > maximum (%u) at line %ld of job script", cpu_range[0], cpu_range[1], line_no);
                   }
                   return SLURM_ERROR;
                 }
@@ -542,6 +789,108 @@ next_number:
             /* Skip whitespace: */
             while ( *s && (*s != '\n') && isspace(*s) ) s++;
             
+            /* Begin processing comma-separated "resource=value" pairs: */
+            while ( *s && (*s != '\n') ) {
+              char          *rs = s, *re = s;
+              char          *vs = NULL, *ve = NULL;
+              
+              /* Isolate the resource name: */
+              while ( *re && (*re != '\n') && (*re != '=') ) re++;
+              
+              /* Is that the end of the line? */
+              if ( *re == '=' ) {
+                char        delim = ',';
+                char        pc = 0;
+                
+                /* There's a value to grab, too: */
+                vs = re + 1;
+                
+                /* Quoted strings need to be handled, too: */
+                if ( (*vs == '"') || (*vs == '\'') ) {
+                  delim = *vs;
+                  vs++;
+                }
+                
+                /* Locate the terminating delimiter: */
+                ve = vs;
+                while ( *ve && (*ve != '\n') ) {
+                  if ( (*ve == delim) && (pc != '\\') ) break;
+                  pc = *ve;
+                  ve++;
+                }
+                
+                /* Badly quoted string? */
+                if ( (delim != ',') && (*ve != delim) ) {
+                  if ( err_msg ) {
+                    *err_msg = xstrdup_printf("unterminated quoted string at line %ld of job script %c", line_no, delim);
+                  }
+                  return SLURM_ERROR;
+                }
+                
+                if ( *ve && (*ve != '\n') ) {
+                  s = ve + 1;
+                } else {
+                  s = ve;
+                }
+              } else {
+                if ( *re == ',' ) {
+                  s = re + 1;
+                } else {
+                  s = re;
+                }
+              }
+              
+              /* React to the resource=value: */
+              if ( (re - rs) > 1 ) {
+                if ( job_submit_resource_name_in_set(rs, re - rs, "m_mem_free", "mfree", "mem_free", "mf", NULL) ) {
+                  /* Per-slot memory request: */
+                  uint64_t      mem_per_cpu;
+                  
+                  debug3(PLUGIN_SUBTYPE ": m_mem_free resource spec present");
+                  if ( job_submit_sge_parse_memory(vs, ve - vs, &mem_per_cpu) ) {
+                    job_desc->pn_min_memory = mem_per_cpu | MEM_PER_CPU;
+                    info(PLUGIN_SUBTYPE ": memory request of %lu MiB per CPU from -l m_mem_free option", mem_per_cpu);
+                  } else {
+                    if ( err_msg ) {
+                      *err_msg = xstrdup_printf("invalid memory specification for m_mem_free resource at line %ld of job script", line_no);
+                    }
+                    return SLURM_ERROR;
+                  }
+                }
+                else if ( job_submit_resource_name_equal(rs, re - rs, "h_rt") ) {
+                  /* Maximum walltime request: */
+                  uint32_t      limit;
+                  
+                  debug3(PLUGIN_SUBTYPE ": h_rt resource spec present");
+                  if ( job_submit_sge_parse_time(vs, ve - vs, &limit) ) {
+                    job_desc->time_limit = limit;
+                    info(PLUGIN_SUBTYPE ": maximum walltime of %u from -l h_rt option", limit);
+                  } else {
+                    if ( err_msg ) {
+                      *err_msg = xstrdup_printf("invalid time specification for h_rt resource at line %ld of job script", line_no);
+                    }
+                    return SLURM_ERROR;
+                  }
+                }
+                else if ( job_submit_resource_name_in_pair(rs, re - rs, "exclusive", "excl") ) {
+                  /* Per-slot memory request: */
+                  sge_bool_t      flag;
+                  
+                  debug3(PLUGIN_SUBTYPE ": exclusive resource spec present");
+                  if ( job_submit_sge_parse_bool(vs, ve - vs, &flag) ) {
+                    if ( (flag != kSGEBooleanNoValue) && (job_desc->shared == NO_VAL16) ) {
+                      job_desc->shared = (flag == kSGEBooleanTrue) ? 0 : 1;
+                      info(PLUGIN_SUBTYPE ": node sharing option %d from -l exclusive option", (int)job_desc->shared);
+                    }
+                  } else {
+                    if ( err_msg ) {
+                      *err_msg = xstrdup_printf("invalid specification for exclusive resource at line %ld of job script", line_no);
+                    }
+                    return SLURM_ERROR;
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -611,8 +960,8 @@ job_submit(
 
   /* Memory limit _must_ be set: */
   if ( (job_desc->pn_min_memory <= 0) || (job_desc->pn_min_memory == NO_VAL64) ) {
-    job_desc->pn_min_memory = udhcp_min_mem_mb;
-    info(PLUGIN_SUBTYPE ": setting default memory limit (%lu MiB)", udhcp_min_mem_mb);
+    job_desc->pn_min_memory = udhpc_min_mem_mb | MEM_PER_CPU;
+    info(PLUGIN_SUBTYPE ": setting default memory limit (%lu MiB per CPU)", udhpc_min_mem_mb);
   }
   
   /* Set the job account to match the submission group: */
