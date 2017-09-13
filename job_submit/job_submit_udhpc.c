@@ -779,7 +779,7 @@ next_number:    v = strtol(s, &e, 10);
           }
           
 /*
- * -l <complex>{=<value>}{,<complex>{=<value>}{,..}}
+ * -l <complex>=<value>{,<complex>=<value>{,..}}
  */
           else if ( (*s == 'l') && isspace(s[1]) ) {
             s += 1;
@@ -848,8 +848,12 @@ next_number:    v = strtol(s, &e, 10);
                   
                   debug3(PLUGIN_SUBTYPE ": m_mem_free resource spec present");
                   if ( job_submit_sge_parse_memory(vs, ve - vs, &mem_per_cpu) ) {
-                    job_desc->pn_min_memory = mem_per_cpu | MEM_PER_CPU;
-                    info(PLUGIN_SUBTYPE ": memory request of %lu MiB per CPU from -l m_mem_free option", mem_per_cpu);
+                    if ( job_desc->pn_min_memory == NO_VAL64 ) {
+                      job_desc->pn_min_memory = mem_per_cpu | MEM_PER_CPU;
+                      info(PLUGIN_SUBTYPE ": memory request of %lu MiB per CPU from -l m_mem_free option", mem_per_cpu);
+                    } else {
+                      info(PLUGIN_SUBTYPE ": ignoring -l m_mem_free option, value specified elsewhere");
+                    }
                   } else {
                     if ( err_msg ) {
                       *err_msg = xstrdup_printf("invalid memory specification for m_mem_free resource at line %ld of job script", line_no);
@@ -863,8 +867,12 @@ next_number:    v = strtol(s, &e, 10);
                   
                   debug3(PLUGIN_SUBTYPE ": h_rt resource spec present");
                   if ( job_submit_sge_parse_time(vs, ve - vs, &limit) ) {
-                    job_desc->time_limit = limit;
-                    info(PLUGIN_SUBTYPE ": maximum walltime of %u from -l h_rt option", limit);
+                    if ( job_desc->time_limit == NO_VAL ) {
+                      job_desc->time_limit = limit;
+                      info(PLUGIN_SUBTYPE ": maximum walltime of %u minute%s from -l h_rt option", limit, (limit == 1) ? "" : "s");
+                    } else {
+                      info(PLUGIN_SUBTYPE ": ignoring -l h_rt option, value specified elsewhere");
+                    }
                   } else {
                     if ( err_msg ) {
                       *err_msg = xstrdup_printf("invalid time specification for h_rt resource at line %ld of job script", line_no);
@@ -878,9 +886,13 @@ next_number:    v = strtol(s, &e, 10);
                   
                   debug3(PLUGIN_SUBTYPE ": exclusive resource spec present");
                   if ( job_submit_sge_parse_bool(vs, ve - vs, &flag) ) {
-                    if ( (flag != kSGEBooleanNoValue) && (job_desc->shared == NO_VAL16) ) {
-                      job_desc->shared = (flag == kSGEBooleanTrue) ? 0 : 1;
-                      info(PLUGIN_SUBTYPE ": node sharing option %d from -l exclusive option", (int)job_desc->shared);
+                    if ( flag != kSGEBooleanNoValue ) {
+                      if ( job_desc->shared == NO_VAL16 ) {
+                        job_desc->shared = (flag == kSGEBooleanTrue) ? 0 : 1;
+                        info(PLUGIN_SUBTYPE ": node sharing option %d from -l exclusive option", (int)job_desc->shared);
+                      } else {
+                        info(PLUGIN_SUBTYPE ": ignoring -l exclusive option, value specified elsewhere");
+                      }
                     }
                   } else {
                     if ( err_msg ) {
