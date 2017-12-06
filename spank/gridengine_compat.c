@@ -262,7 +262,7 @@ slurm_spank_init(
  * the base path for the new TMPDIR; if SLURM doesn't hand us a TMPDIR
  * then we default to using /tmp as our base directory.
  *
- * This function does not actually create the directory; 
+ * This function does not actually create the directory.
  *
  * (Called from srun after allocation before launch.)
  */
@@ -278,6 +278,40 @@ slurm_spank_local_user_init(
   
   if ( tmpdirlen > 0 ) {
     if ( setenv("TMPDIR", tmpdir, 1) < 0 ) {
+      slurm_error("setenv(TMPDIR, \"%s\"): %m", tmpdir);
+      return (-1);
+    }
+    slurm_verbose("gridengine_compat: TMPDIR = %s", tmpdir);
+  }
+  return (0);
+}
+
+
+/*
+ * @function slurm_spank_user_init
+ *
+ * Set job-specific TMPDIR in environment.  For batch scripts the path
+ * uses just the job id; for all others, the path uses the job id, a dot,
+ * and the job step id.  The value of TMPDIR handed to us by SLURM is
+ * the base path for the new TMPDIR; if SLURM doesn't hand us a TMPDIR
+ * then we default to using /tmp as our base directory.
+ *
+ * This function does not actually create the directory.
+ *
+ * (Called from slurmstepd after it starts.)
+ */
+int
+slurm_spank_user_init(
+  spank_t       spank_ctxt,
+  int           argc,
+  char          *argv[]
+)
+{
+  char          tmpdir[PATH_MAX];
+  int           tmpdirlen = _get_tmpdir(spank_ctxt, tmpdir, sizeof(tmpdir));
+  
+  if ( tmpdirlen > 0 ) {
+    if ( spank_setenv(spank_ctxt, "TMPDIR", tmpdir, tmpdirlen) != ESPANK_SUCCESS ) {
       slurm_error("setenv(TMPDIR, \"%s\"): %m", tmpdir);
       return (-1);
     }
@@ -429,18 +463,40 @@ slurm_spank_exit(
       struct stat   finfo;
 
       if (spank_get_item (spank_ctxt, S_JOB_UID, &jobUid) != ESPANK_SUCCESS) {
-        slurm_error ("gridengine_compat: unable to get job's user id");
+        slurm_error ("gridengine_compat: remote: unable to get job's user id");
         return (-1);
       }
       
       if ( (stat(tmpdir, &finfo) == 0) && S_ISDIR(finfo.st_mode) ) {
-        if ( ! _rmdir_recurse(tmpdir, jobUid) ) {
-          slurm_error("gridengine_compat: Unable to remove TMPDIR at exit (failure in _rmdir_recurse(%s,%d))", tmpdir, jobUid);
+        if ( _rmdir_recurse(tmpdir, jobUid) != 0 ) {
+          slurm_error("gridengine_compat: remote: Unable to remove TMPDIR at exit (failure in _rmdir_recurse(%s,%d))", tmpdir, jobUid);
           return (-1);
         }
-        slurm_verbose("gridengine_compat: rm -rf %s", tmpdir);
+        slurm_verbose("gridengine_compat: remote: rm -rf %s", tmpdir);
       } else {
-        slurm_error("gridengine_compat:  failed stat check of %s (uid = %d, st_mode = %x, errno = %d)", tmpdir, jobUid, finfo.st_mode, errno);
+        slurm_error("gridengine_compat: remote: failed stat check of %s (uid = %d, st_mode = %x, errno = %d)", tmpdir, jobUid, finfo.st_mode, errno);
+      }
+    }
+  } else {
+    const char    *tmpdir = getenv("TMPDIR");
+    
+    if ( tmpdir ) {
+      uid_t         jobUid = -1;
+      struct stat   finfo;
+
+      if (spank_get_item (spank_ctxt, S_JOB_UID, &jobUid) != ESPANK_SUCCESS) {
+        slurm_error ("gridengine_compat: local: unable to get job's user id");
+        return (-1);
+      }
+      
+      if ( (stat(tmpdir, &finfo) == 0) && S_ISDIR(finfo.st_mode) ) {
+        if ( _rmdir_recurse(tmpdir, jobUid) != 0 ) {
+          slurm_error("gridengine_compat: local: Unable to remove TMPDIR at exit (failure in _rmdir_recurse(%s,%d))", tmpdir, jobUid);
+          return (-1);
+        }
+        slurm_verbose("gridengine_compat: local: rm -rf %s", tmpdir);
+      } else {
+        slurm_error("gridengine_compat: local: failed stat check of %s (uid = %d, st_mode = %x, errno = %d)", tmpdir, jobUid, finfo.st_mode, errno);
       }
     }
   }
