@@ -47,6 +47,11 @@ SPANK_PLUGIN(gridengine_compat, 1)
 static int should_add_sge_env = 0;
 
 /*
+ * What's the base directory to use for temp files?
+ */
+static const char *base_tmpdir = NULL;
+
+/*
  * @function _opt_add_sge_env
  *
  * Parse the --add-sge-env option.
@@ -60,7 +65,29 @@ static int _opt_add_sge_env(
 {
   should_add_sge_env = 1;
   slurm_verbose("gridengine_compat:  will add SGE-style environment variables to job");
-  return 0;
+  return ESPANK_SUCCESS;
+}
+
+/*
+ * @function _opt_tmpdir
+ *
+ * Parse the --tmpdir=<path> option.
+ *
+ */
+static int _opt_tmpdir(
+  int         val,
+  const char  *optarg,
+  int         remote
+)
+{
+  if ( *optarg != '/' ) {
+    slurm_error("gridengine_compat:  invalid path to --tmpdir: %s", optarg);
+    return ESPANK_BAD_ARG;
+  }
+  
+  base_tmpdir = strdup(optarg);
+  slurm_verbose("gridengine_compat:  will add SGE-style environment variables to job");
+  return ESPANK_SUCCESS;
 }
 
 /*
@@ -71,8 +98,22 @@ struct spank_option spank_options[] =
     { "add-sge-env", NULL,
       "Add GridEngine equivalents of SLURM job environment variables.",
       0, 0, (spank_opt_cb_f) _opt_add_sge_env },
+    { "tmpdir", "<path>",
+      "Use the given path as the base directory for temporary files.",
+      1, 0, (spank_opt_cb_f) _opt_tmpdir },
     SPANK_OPTIONS_TABLE_END
 };
+
+
+const char*
+_get_base_tmpdir()
+{
+  const char      *tmpdir;
+  
+  if ( base_tmpdir ) return base_tmpdir;
+  return "/tmp";
+}
+
 
 
 int
@@ -85,7 +126,6 @@ _get_tmpdir(
   uint32_t      job_id = 0;
   uint32_t      job_step_id = 0;
   const char    *tmpdir = NULL;
-  const char    *tmpdir_format = NULL;
   int           actual_len = 0;
   
   /* Get the job id and step id: */
@@ -98,22 +138,61 @@ _get_tmpdir(
     return (-1);
   }
   
-  /* Default to /tmp if SLURM doesn't have TMPDIR set in the environment: */
-  if ( (tmpdir = getenv ("TMPDIR")) == NULL ) tmpdir = "/tmp";
+  /* Retrieve the base temp directory: */
+  tmpdir = _get_base_tmpdir();
   
   /* Decide which format the directory should use and determine string length: */
   if ( job_step_id == SLURM_BATCH_SCRIPT ) {
-    tmpdir_format = "%s/%u";
+    actual_len = snprintf(outTmpDir, outTmpDirLen, "%s/%u", tmpdir, job_id);
   } else {
-    tmpdir_format = "%s/%u.%u";
+    actual_len = snprintf(outTmpDir, outTmpDirLen, "%s/%u/%u", tmpdir, job_id, job_step_id);
   }
-  actual_len = snprintf(outTmpDir, outTmpDirLen, tmpdir_format, tmpdir, job_id, job_step_id);
   
   /* If the snprintf() failed then we've got big problems: */
   if ( (actual_len < 0) || (actual_len >= outTmpDirLen) ) {
     slurm_error("gridengine_compat: Failure while creating new tmpdir path: %d", actual_len);
     return (-1);
+  } else {
+    struct stat   finfo;
+    
+    /* Build the path, making sure each component exists: */
+    strncpy(outTmpDir, tmpdir, outTmpDirLen);
+    if ( (stat(outTmpDir, &finfo) == 0) && S_ISDIR(finfo.st_mode) ) {
+      /* At the least we'll need the job directory: */
+      actual_len = snprintf(outTmpDir, outTmpDirLen, "%s/%u", tmpdir, job_id);
+      if ( stat(outTmpDir, &finfo) != 0 ) {
+        if ( mkdir(outTmpDir, 0700) != 0 ) {
+          slurm_error("gridengine_compat: failed creating job tmpdir: %s", outTmpDir);
+          return (-1);
+        }
+        stat(outTmpDir, &finfo);
+      }
+      if ( ! S_ISDIR(finfo.st_mode) ) {
+        slurm_error("gridengine_compat: job tmpdir is not a directory: %s", outTmpDir);
+        return (-1);
+      }
+      
+      /* If this isn't the batch portion of a job, worry about the step subdir: */
+      if ( job_step_id != SLURM_BATCH_SCRIPT ) {
+        actual_len = snprintf(outTmpDir, outTmpDirLen, "%s/%u/%u", tmpdir, job_id, job_step_id);
+        if ( stat(outTmpDir, &finfo) != 0 ) {
+          if ( mkdir(outTmpDir, 0700) != 0 ) {
+            slurm_error("gridengine_compat: failed creating step tmpdir: %s", outTmpDir);
+            return (-1);
+          }
+          stat(outTmpDir, &finfo);
+        }
+        if ( ! S_ISDIR(finfo.st_mode) ) {
+          slurm_error("gridengine_compat: step tmpdir is not a directory: %s", outTmpDir);
+          return (-1);
+        }
+      }
+    } else {
+      slurm_error("gridengine_compat: base tmpdir is not a directory: %s", tmpdir);
+      return (-1);
+    }
   }
+  
   return actual_len;
 }
 
@@ -244,7 +323,17 @@ slurm_spank_init(
       } else if ( strcasecmp(optarg, "n") && strcasecmp(optarg, "no") && strcasecmp(optarg, "f") && strcasecmp(optarg, "false") ) {
         slurm_error("gridengine_compat: Ignoring invalid enable option: %s", argv[i]);
       }
-    } else {
+    }
+    else if ( strncmp("tmpdir=", argv[i], 7) == 0 ) {
+      const char          *optarg = argv[i] + 7;
+      
+      if ( *optarg == '/' ) {
+        base_tmpdir = strdup(optarg);
+      } else {
+        slurm_error("gridengine_compat: base tmpdir must be an absolute path: %s", argv[i]);
+      }
+    }
+    else {
       slurm_error("gridengine_compat: Invalid option: %s", argv[i]);
     }
   }
@@ -458,7 +547,7 @@ slurm_spank_exit(
   if ( spank_remote(spank_ctxt) ) {
     char            tmpdir[PATH_MAX];
     
-    if ( spank_getenv(spank_ctxt, "TMPDIR", tmpdir, sizeof(tmpdir)) == ESPANK_SUCCESS) {
+    if ( spank_getenv(spank_ctxt, "TMPDIR", tmpdir, sizeof(tmpdir)) == ESPANK_SUCCESS ) {
       uid_t         jobUid = -1;
       struct stat   finfo;
 
@@ -478,25 +567,22 @@ slurm_spank_exit(
       }
     }
   } else {
-    const char    *tmpdir = getenv("TMPDIR");
+    const char      *tmpdir = getenv("TMPDIR");
     
     if ( tmpdir ) {
-      uid_t         jobUid = -1;
+      uid_t         jobUid = geteuid();
       struct stat   finfo;
-
-      if (spank_get_item (spank_ctxt, S_JOB_UID, &jobUid) != ESPANK_SUCCESS) {
-        slurm_error ("gridengine_compat: local: unable to get job's user id");
-        return (-1);
-      }
       
-      if ( (stat(tmpdir, &finfo) == 0) && S_ISDIR(finfo.st_mode) ) {
-        if ( _rmdir_recurse(tmpdir, jobUid) != 0 ) {
-          slurm_error("gridengine_compat: local: Unable to remove TMPDIR at exit (failure in _rmdir_recurse(%s,%d))", tmpdir, jobUid);
-          return (-1);
+      /* We don't care if the directory doesn't exist anymore... */
+      if ( stat(tmpdir, &finfo) == 0 ) {
+        /*  ...but if it does, let's get rid of it. */
+        if ( S_ISDIR(finfo.st_mode) ) {
+          if ( _rmdir_recurse(tmpdir, jobUid) != 0 ) {
+            slurm_error("gridengine_compat: local: Unable to remove TMPDIR at exit (failure in _rmdir_recurse(%s,%d))", tmpdir, jobUid);
+            return (-1);
+          }
+          slurm_verbose("gridengine_compat: local: rm -rf %s", tmpdir);
         }
-        slurm_verbose("gridengine_compat: local: rm -rf %s", tmpdir);
-      } else {
-        slurm_error("gridengine_compat: local: failed stat check of %s (uid = %d, st_mode = %x, errno = %d)", tmpdir, jobUid, finfo.st_mode, errno);
       }
     }
   }
