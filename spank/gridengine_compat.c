@@ -136,105 +136,96 @@ slurm_spank_task_init(
 )
 {
   char          value[8192];
-  int           did_set_nslots = 0;
+  long          ntasks = 1, ncpus_per_task = 1;
   
-  if ( spank_remote(spank_ctxt) && should_add_sge_env ) {
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_CLUSTER_NAME", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_CLUSTER_NAME", value, 1);
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_SUBMIT_DIR", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_O_WORKDIR", value, 1);
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_SUBMIT_HOST", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_O_HOST", value, 1);
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_JOB_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
-      spank_setenv(spank_ctxt, "JOB_ID", value, 1);
-    
-      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_ID", value, 1);
+  if ( spank_remote(spank_ctxt) ) {
+    if ( should_add_sge_env ) {
+      if ( spank_getenv(spank_ctxt, "SLURM_CLUSTER_NAME", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_CLUSTER_NAME", value, 1);
       
-      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_MIN", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_FIRST", value, 1);
+      if ( spank_getenv(spank_ctxt, "SLURM_SUBMIT_DIR", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_O_WORKDIR", value, 1);
       
-      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_MAX", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_LAST", value, 1);
+      if ( spank_getenv(spank_ctxt, "SLURM_SUBMIT_HOST", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_O_HOST", value, 1);
       
-      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_STEP", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_STEPSIZE", value, 1);
-    }
-    else if ( spank_getenv(spank_ctxt, "SLURM_JOB_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
-      spank_setenv(spank_ctxt, "JOB_ID", value, 1);
-    }
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_JOB_NAME", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
-      spank_setenv(spank_ctxt, "JOB_NAME", value, 1);
-    }
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_JOB_PARTITION", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "QUEUE", value, 1);
-    spank_setenv(spank_ctxt, "NQUEUES", "1", 1);
-    
-    if ( spank_getenv(spank_ctxt, "SLURM_JOB_NUM_NODES", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
-      spank_setenv(spank_ctxt, "NHOSTS", value, 1);
-    } else {
-      spank_setenv(spank_ctxt, "NHOSTS", "1", 1);
-    }
-    
-    /*
-     * We will not setup a PE_HOSTFILE, since doing so could cause tightly-integrated
-     * MPI implementations (like Open MPI) to mistakenly think that we're actually
-     * using Grid Engine.
-     */
-    
-    /*
-     * Hmm...how do we calculate NSLOTS for a job step?  Looks like the
-     * best bet is SLURM_JOB_CPUS_PER_NODE, which is a comma-delimited list
-     * of integers with optional repeat counts:
-     *
-     *    1(x2),2(x3) == 1,1,2,2,2
-     *
-     * the sequence matches that of node names that are presented in the
-     * SLURM_JOB_NODELIST variable (as a set of SLURM hostname expressions).
-     *
-     */
-    if ( (spank_getenv(spank_ctxt, "SLURM_JOB_CPUS_PER_NODE", value, sizeof(value)) == ESPANK_SUCCESS) && *value ) {
-      unsigned  nslots = 0;
-      char      *p = value;
+      if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_JOB_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+        spank_setenv(spank_ctxt, "JOB_ID", value, 1);
       
-      while ( *p ) {
-        char    *e;
-        long    n;
+        if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_ID", value, 1);
         
-        if ( ((n = strtol(p, &e, 10)) > 0) && (e > p) ) {
-          if ( e[0] == '(' && e[1] == 'x' ) {
-            long    r;
-            
-            p = e + 2;
-            if ( ((r = strtol(p, &e, 10)) > 0) && (e > p) ) {
-              n *= r;
-              p = ( e[0] == ')' ) ? (e + 1) : e;
-            } else {
-              slurm_error("gridengine_compat: slurm_spank_task_init: Unable to parse SLURM_JOB_CPUS_PER_NODE (at index %ld): %s", (p - value), value);
-              break;
-            }
-          } else {
-            p = e;
-          }
-          nslots += n;
-          if ( *p ) {
-            if ( *p == ',' ) {
-              p++;
-            } else {
-              slurm_error("gridengine_compat: slurm_spank_task_init: Unable to parse SLURM_JOB_CPUS_PER_NODE (at index %ld): %s", (p - value), value);
-              break;
-            }
-          }
-        } else {
-          slurm_error("gridengine_compat: slurm_spank_task_init: Unable to parse SLURM_JOB_CPUS_PER_NODE (at index %ld): %s", (p - value), value);
-          break;
+        if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_MIN", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_FIRST", value, 1);
+        
+        if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_MAX", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_LAST", value, 1);
+        
+        if ( spank_getenv(spank_ctxt, "SLURM_ARRAY_TASK_STEP", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "SGE_TASK_STEPSIZE", value, 1);
+      }
+      else if ( spank_getenv(spank_ctxt, "SLURM_JOB_ID", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+        spank_setenv(spank_ctxt, "JOB_ID", value, 1);
+      }
+      
+      if ( spank_getenv(spank_ctxt, "SLURM_JOB_NAME", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+        spank_setenv(spank_ctxt, "JOB_NAME", value, 1);
+      }
+      
+      if ( spank_getenv(spank_ctxt, "SLURM_JOB_PARTITION", value, sizeof(value)) == ESPANK_SUCCESS && *value ) spank_setenv(spank_ctxt, "QUEUE", value, 1);
+      spank_setenv(spank_ctxt, "NQUEUES", "1", 1);
+      
+      /*
+       * For NHOSTS, we take the step value if present, the overall job value otherwise:
+       */
+      if ( spank_getenv(spank_ctxt, "SLURM_STEP_NUM_NODES", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+        spank_setenv(spank_ctxt, "NHOSTS", value, 1);
+      }
+      else if ( spank_getenv(spank_ctxt, "SLURM_JOB_NUM_NODES", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+        spank_setenv(spank_ctxt, "NHOSTS", value, 1);
+      } else {
+        spank_setenv(spank_ctxt, "NHOSTS", "1", 1);
+      }
+      
+      /*
+       * Determine how many cpus per task:
+       */
+      if ( spank_getenv(spank_ctxt, "SLURM_CPUS_PER_TASK", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+        ncpus_per_task = strtol(value, NULL, 10);
+        if ( ncpus_per_task <= 0 ) ncpus_per_task = 1;
+      }
+      
+      /*
+       * For the number of tasks, we take the step value if present, the overall job value
+       * otherwise:
+       */
+      if ( (spank_getenv(spank_ctxt, "SLURM_STEP_NUM_TASKS", value, sizeof(value)) == ESPANK_SUCCESS && *value) ||
+           (spank_getenv(spank_ctxt, "SLURM_NTASKS", value, sizeof(value)) == ESPANK_SUCCESS && *value)
+      ) {
+        ntasks = strtol(value, NULL, 10);
+        if ( ntasks <= 0 ) {
+          ntasks = 1;
+          ncpus_per_task = 1;
         }
       }
-      if ( (nslots > 0) && (snprintf(value, sizeof(value), "%u", nslots) > 0) ) {
+      if ( snprintf(value, sizeof(value), "%ld", ntasks * ncpus_per_task) > 0 ) {
         spank_setenv(spank_ctxt, "NSLOTS", value, 1);
-        did_set_nslots = 1;
       }
-    }
-    if ( ! did_set_nslots ) {
-      spank_setenv(spank_ctxt, "NSLOTS", "1", 1);
+      if ( snprintf(value, sizeof(value), "%ld", ncpus_per_task) > 0 ) {
+        spank_setenv(spank_ctxt, "OMP_NUM_THREADS", value, 1);
+        spank_setenv(spank_ctxt, "OMP_THREAD_LIMIT", value, 1);
+      }
+      
+      /*
+       * We will not setup a PE_HOSTFILE, since doing so could cause tightly-integrated
+       * MPI implementations (like Open MPI) to mistakenly think that we're actually
+       * using Grid Engine.
+       */
+    } else {
+      /*
+       * Set the OpenMP stuff no matter what:
+       */
+      if ( spank_getenv(spank_ctxt, "SLURM_CPUS_PER_TASK", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+        ncpus_per_task = strtol(value, NULL, 10);
+        if ( ncpus_per_task <= 0 ) ncpus_per_task = 1;
+      }
+      if ( snprintf(value, sizeof(value), "%ld", ncpus_per_task) > 0 ) {
+        spank_setenv(spank_ctxt, "OMP_NUM_THREADS", value, 1);
+        spank_setenv(spank_ctxt, "OMP_THREAD_LIMIT", value, 1);
+      }
     }
   }
   return (0);
