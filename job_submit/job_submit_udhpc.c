@@ -10,6 +10,7 @@
 #include "slurm/slurm_errno.h"
 #include "src/common/slurm_xlator.h"
 #include "src/common/fd.h"
+#include "src/common/env.h"
 #include "src/slurmctld/locks.h"
 #include "src/slurmctld/slurmctld.h"
 
@@ -431,7 +432,36 @@ job_submit_sge_parser(
   size_t                line_len;
   bool                  should_join_stdout_stderr = true;
   bool                  is_set_stderr = ( job_desc->std_err ? true : false );
-  
+  bool                  has_cpu_counts = 0;
+                  
+  info(PLUGIN_SUBTYPE ": cpu constraints before => ntasks = %u, cpus_per_task = %hu, bitflags = %08x, cpus = %u-%u, nodes = %u-%u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u",
+      job_desc->num_tasks,
+      job_desc->cpus_per_task,
+      job_desc->bitflags,
+      job_desc->min_cpus,
+      job_desc->max_cpus,
+      job_desc->min_nodes,
+      job_desc->max_nodes,
+      job_desc->boards_per_node,
+      job_desc->sockets_per_board,
+      job_desc->sockets_per_node,
+      job_desc->cores_per_socket,
+      job_desc->threads_per_core,
+      job_desc->ntasks_per_node,
+      job_desc->ntasks_per_socket,
+      job_desc->ntasks_per_core,
+      job_desc->ntasks_per_board,
+      job_desc->pn_min_cpus
+    );
+  int     i = 0;
+  while ( i < job_desc->env_size ) {
+    if ( (strncmp(job_desc->environment[i], "SLURM_NTASKS=", 13) == 0) ||
+         (strncmp(job_desc->environment[i], "SLURM_CPUS_PER_TASK=", 20) == 0)
+    ) {
+      has_cpu_counts = 1;
+    }
+    i++;
+  }
   while ( *line == '#' ) {
     line_len = 0;
     
@@ -463,20 +493,22 @@ job_submit_sge_parser(
             /* We only apply these options if they haven't already
              * been chosen on the CLI.
              */
-            if ( (job_desc->min_cpus == 1) &&
-                 (job_desc->max_cpus == NO_VAL)
-              )
-            {
+            if ( ! has_cpu_counts ) {
               int         index = 0;
               uint32_t    cpu_range[2] = { 1, NO_VAL };
+              char        *pe_name = NULL;
+              size_t      pe_name_len = 0;
+              int         is_range = 0;
               
               debug3(PLUGIN_SUBTYPE ": -pe option found");
               
               /* Skip whitespace: */
               while ( *s && (*s != '\n') && isspace(*s) ) s++;
               
-              /* Skip the next word: */
+              /* Isolate the next word: */
+              pe_name = s;
               while ( *s && (*s != '\n') && ! isspace(*s) ) s++;
+              pe_name_len = s - pe_name;
               
               /* Skip whitespace: */
               while ( *s && (*s != '\n') && isspace(*s) ) s++;
@@ -487,6 +519,7 @@ job_submit_sge_parser(
               if ( *s == '-' ) {
                 s++;
                 index = 1;
+                is_range = 1;
               }
               
               /* If the next word looks like a number, then proceed: */
@@ -504,6 +537,7 @@ next_number:    v = strtol(s, &e, 10);
                        * range and we should check the next word, too:
                        */
                       if ( *e++ == '-') {
+                        is_range = 1;
                         if ( isdigit(*e) ) {
                           s = e;
                           goto next_number;
@@ -527,11 +561,57 @@ next_number:    v = strtol(s, &e, 10);
                   }
                   return SLURM_ERROR;
                 }
+                
                 if ( cpu_range[0] <= cpu_range[1] ) {
+                    
                   /* Set the task count and cpus per task: */
-                  job_desc->min_cpus = cpu_range[0];
-                  job_desc->max_cpus = cpu_range[1];
-                  info(PLUGIN_SUBTYPE ": cpu count constraints from -pe option => cpu range %u-%u", job_desc->min_cpus, job_desc->max_cpus);
+                  if ( (pe_name_len == 7) && (strncmp(pe_name, "threads", 7) == 0) ) {
+                    job_desc->num_tasks = 1;
+                    job_desc->cpus_per_task = ( is_range ) ? cpu_range[1] : cpu_range[0];
+                    job_desc->pn_min_cpus = job_desc->min_cpus = job_desc->cpus_per_task;
+                    job_desc->max_cpus = NO_VAL;
+                  }
+                  else if (
+                    ((pe_name_len == 3) && (strncmp(pe_name, "mpi", 3) == 0)) ||
+                    ((pe_name_len == 11) && (strncmp(pe_name, "generic-mpi", 11) == 0))
+                  ) {
+                    job_desc->num_tasks = ( is_range ) ? cpu_range[1] : cpu_range[0];
+                    job_desc->cpus_per_task = 1;
+                    job_desc->pn_min_cpus = job_desc->min_cpus = job_desc->num_tasks;
+                    job_desc->max_cpus = NO_VAL;
+                  }
+                  else {
+                    if ( err_msg ) {
+                      *err_msg = xstrdup_printf("invalid pe name at line %ld of job script", line_no);
+                    }
+                    return SLURM_ERROR;
+                  }
+                  
+                  //
+                  // We need to update the environment variables a'la sbatch's init_envs() function:
+                  //
+                  if ( ! env_array_append_fmt(&job_desc->environment, "SLURM_NTASKS", "%u", (unsigned int)job_desc->num_tasks) ) {
+                    if ( err_msg ) {
+                      *err_msg = xstrdup("unable to export SLURM_NTASKS to job environment");
+                    }
+                    return SLURM_ERROR;
+                  }
+                  job_desc->env_size++;
+                  if ( ! env_array_append_fmt(&job_desc->environment, "SLURM_NPROCS", "%u", (unsigned int)job_desc->num_tasks) ) {
+                    if ( err_msg ) {
+                      *err_msg = xstrdup("unable to export SLURM_NPROCS to job environment");
+                    }
+                    return SLURM_ERROR;
+                  }
+                  job_desc->env_size++;
+                  if ( ! env_array_append_fmt(&job_desc->environment, "SLURM_CPUS_PER_TASK", "%u", (unsigned int)job_desc->num_tasks) ) {
+                    if ( err_msg ) {
+                      *err_msg = xstrdup("unable to export SLURM_CPUS_PER_TASK to job environment");
+                    }
+                    return SLURM_ERROR;
+                  }
+                  job_desc->env_size++;
+                  
                 } else {
                   if ( err_msg ) {
                     *err_msg = xstrdup_printf("slot minimum (%u) > maximum (%u) at line %ld of job script", cpu_range[0], cpu_range[1], line_no);
@@ -939,6 +1019,27 @@ next_number:    v = strtol(s, &e, 10);
     }
     info(PLUGIN_SUBTYPE ": stderr set to path \"%s\"", job_desc->std_err);
   }
+  
+                  
+  info(PLUGIN_SUBTYPE ": cpu constraints after => ntasks = %u, cpus_per_task = %hu, bitflags = %08x, cpus = %u-%u, nodes = %u-%u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u",
+      job_desc->num_tasks,
+      job_desc->cpus_per_task,
+      job_desc->bitflags,
+      job_desc->min_cpus,
+      job_desc->max_cpus,
+      job_desc->min_nodes,
+      job_desc->max_nodes,
+      job_desc->boards_per_node,
+      job_desc->sockets_per_board,
+      job_desc->sockets_per_node,
+      job_desc->cores_per_socket,
+      job_desc->threads_per_core,
+      job_desc->ntasks_per_node,
+      job_desc->ntasks_per_socket,
+      job_desc->ntasks_per_core,
+      job_desc->ntasks_per_board,
+      job_desc->pn_min_cpus
+    );
   
   return SLURM_SUCCESS;
 }
