@@ -65,9 +65,9 @@ job_submit_udhpc_getgrgid(
             continue;
           }
         }
-      } else {
+      } else if ( group_info_ptr ) {
         /* Success! */
-        out_gname = xstrdup(group_info.gr_name);
+        out_gname = xstrdup(group_info_ptr->gr_name);
       }
       break;
     }
@@ -1102,6 +1102,77 @@ job_submit(
         *err_msg = xstrdup("Please choose a workgroup before submitting a job");
       }
       return SLURM_ERROR;
+    }
+  }
+  
+  /* If GRES are requested, then ensure that CPU binding is enforced: */
+  if ( (job_desc->gres != NULL) && (*(job_desc->gres) != '\0') ) {
+    char        *gpu = job_desc->gres;
+    int         gpu_count = 0;
+    
+    job_desc->bitflags |= GRES_ENFORCE_BIND;
+    info(PLUGIN_SUBTYPE ": GRES requested, enabling enforce-bind");
+    
+    /* Let's be really nice and try to ensure that socket-per-node is set appropriately
+     * for GPU requests:
+     */
+    while ( (gpu = xstrcasestr(gpu, "gpu")) != NULL ) {
+      /* Skip past the "gpu" string: */
+      gpu += 3;
+      if ( *gpu == ':' ) {
+        if ( xstrncasecmp(":p100", gpu, 5) == 0 ) gpu += 5;
+        if ( *gpu == ':' ) gpu++;
+        /* What should follow is an integer, comma, or end of string: */
+        switch ( *gpu ) {
+          case ',':
+            gpu++;
+          case '\0':
+            gpu_count += 1;
+            break;
+          
+          case '0':
+          case '1':
+          case '2':
+          case '3':
+          case '4':
+          case '5':
+          case '6':
+          case '7':
+          case '8':
+          case '9': {
+            char  *end = NULL;
+            long  i = strtol(gpu, &end, 10);
+            
+            if ( (end == NULL) || (end <= gpu) ) {
+              /* Not an appropriate GPU request: */
+              if ( err_msg ) {
+                *err_msg = xstrdup_printf("Invalid GPU request option: %s", gpu);
+              }
+              return SLURM_ERROR;
+            }
+            gpu = end;
+            gpu_count += i;
+            break;
+          }
+        }
+      } else {
+        /* Since we only have one GPU type, it's okay not to specify type or count: */
+        if ( *gpu ) gpu++;
+        gpu_count += 1;
+      }
+    }
+    if ( gpu_count > 0 ) {
+      job_desc->sockets_per_node = gpu_count;
+      info(PLUGIN_SUBTYPE ": total of %d GPUs requested, setting sockets-per-node accordingly", gpu_count);
+      
+      /* Ensure a "gpu" partition is part of the request: */
+      if ( (job_desc->partition == NULL) || (*(job_desc->partition) == '\0') ) {
+        job_desc->partition = xstrdup("gpu");
+        info(PLUGIN_SUBTYPE ": gpu partition selected");
+      } else if ( xstrcasestr(job_desc->partition, "gpu") == NULL ) {
+        xstrcat(job_desc->partition, ",gpu");
+        info(PLUGIN_SUBTYPE ": gpu partition added to partition list");
+      }
     }
   }
   
