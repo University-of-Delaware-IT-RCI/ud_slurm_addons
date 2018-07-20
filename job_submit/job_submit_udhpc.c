@@ -77,6 +77,84 @@ job_submit_udhpc_getgrgid(
 }
 
 
+extern bool
+__is_nonempty_str(
+  const char    *s
+)
+{
+  if ( s != NULL ) {
+    if ( *s != '\0' ) {
+      while ( *s && isspace(*s) ) s++;
+      if ( *s != '\0' ) return true;
+    }
+  }
+  return false;
+}
+
+
+extern bool
+__has_owned_resource_partition(
+  const char  *partition_list
+)
+{
+  char        *base = (char*)partition_list;
+  
+  while ( *base ) {
+    char      *p = base;
+    
+    if ( xstrncasecmp(base, "compute", 7) == 0 ) {
+      p += 7;
+    } else if ( xstrncasecmp(base, "gpu", 3) == 0 ) {
+      p += 3;
+    } else if ( xstrncasecmp(base, "gpu", 3) == 0 ) {
+      p += 3;
+    }
+    if ( p > base ) {
+      int     unit_char = 0;
+      int     byte_char = 0;
+      
+      /* Format for partition names is <type>-<size><unit> */
+      if ( *p == '-' ) {
+        p++;
+        /* Digits: */
+        while ( *p && isdigit(*p) ) p++;
+next_unit_char:
+        switch (*p) {
+          case 'P':
+          case 'p':
+          case 'T':
+          case 't':
+          case 'G':
+          case 'g':
+          case 'M':
+          case 'm':
+            p++;
+            unit_char++;
+            goto next_unit_char;
+          case 'b':
+          case 'B':
+            p++;
+            byte_char++;
+            goto next_unit_char;
+          case ',':
+          case '\0':
+            if ( (unit_char == 1) && (byte_char == 1) ) return true;
+          default:
+            break;
+        }
+      }
+    }
+    p = xstrchr(p, ',');
+    if ( p ) {
+      base = p + 1;
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
+
 extern int
 job_submit_strncasecmp(
   const char    *s1,
@@ -1060,7 +1138,7 @@ job_submit(
    * (if present) and for SGE compatibility check for
    * directives:
    */
-  if ( job_desc->script && *(job_desc->script) ) {
+  if ( __is_nonempty_str(job_desc->script) ) {
     /* Must start with hash-bang: */
     if ( strncmp(job_desc->script, "#!", 2) == 0 ) {
       debug(PLUGIN_SUBTYPE ": checking for SGE flags in script");
@@ -1070,7 +1148,6 @@ job_submit(
     }
   }
 
-
   /* Memory limit _must_ be set: */
   if ( (job_desc->pn_min_memory <= 0) || (job_desc->pn_min_memory == NO_VAL64) ) {
     job_desc->pn_min_memory = udhpc_min_mem_mb | MEM_PER_CPU;
@@ -1078,7 +1155,7 @@ job_submit(
   }
   
   /* Set the job account to match the submission group: */
-  if ( ! job_desc->account ) {
+  if ( ! __is_nonempty_str(job_desc->account) ) {
     gid_t                 submit_gid = job_desc->group_id;
     
     if ( submit_gid >= udhpc_base_gid ) {
@@ -1086,6 +1163,7 @@ job_submit(
       char                *submit_gname = job_submit_udhpc_getgrgid(submit_gid);
       
       if ( submit_gname ) {
+        if ( job_desc->account != NULL ) xfree(job_desc->account);
         job_desc->account = submit_gname;
         info(PLUGIN_SUBTYPE ": setting job account to %s (%u)", submit_gname, submit_gid);
       } else {
@@ -1105,13 +1183,18 @@ job_submit(
     }
   }
   
+  /* Check if any owned-resource partition was chosen; if so, then we need to set
+   * the QOS = account if it wasn't set by the user:
+   */
+  if ( __has_owned_resource_partition(job_desc->partition) && ! __is_nonempty_str(job_desc->qos) ) {
+    job_desc->qos = xstrdup(job_desc->account);
+    info(PLUGIN_SUBTYPE ": setting job qos to %s", job_desc->qos);
+  }
+  
   /* If GRES are requested, then ensure that CPU binding is enforced: */
   if ( (job_desc->gres != NULL) && (*(job_desc->gres) != '\0') ) {
     char        *gpu = job_desc->gres;
     int         gpu_count = 0;
-    
-    job_desc->bitflags |= GRES_ENFORCE_BIND;
-    info(PLUGIN_SUBTYPE ": GRES requested, enabling enforce-bind");
     
     /* Let's be really nice and try to ensure that socket-per-node is set appropriately
      * for GPU requests:
@@ -1161,17 +1244,16 @@ job_submit(
         gpu_count += 1;
       }
     }
-    if ( gpu_count > 0 ) {
+    if ( gpu_count > 0 && (job_desc->partition == NULL) || (*(job_desc->partition) == '\0') || (xstrcasestr(job_desc->partition, "gpu-") != NULL)  ) {
+      job_desc->bitflags |= GRES_ENFORCE_BIND;
+      info(PLUGIN_SUBTYPE ": GPU GRES requested, enabling enforce-bind");
+      
       job_desc->sockets_per_node = gpu_count;
       info(PLUGIN_SUBTYPE ": total of %d GPUs requested, setting sockets-per-node accordingly", gpu_count);
       
-      /* Ensure a "gpu" partition is part of the request: */
       if ( (job_desc->partition == NULL) || (*(job_desc->partition) == '\0') ) {
-        job_desc->partition = xstrdup("gpu");
-        info(PLUGIN_SUBTYPE ": gpu partition selected");
-      } else if ( xstrcasestr(job_desc->partition, "gpu") == NULL ) {
-        xstrcat(job_desc->partition, ",gpu");
-        info(PLUGIN_SUBTYPE ": gpu partition added to partition list");
+        job_desc->partition = xstrdup("gpu-128GB");
+        info(PLUGIN_SUBTYPE ": GRES requested, no partition indicated so defaulting to gpu-128GB");
       }
     }
   }
