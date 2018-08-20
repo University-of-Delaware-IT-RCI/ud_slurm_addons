@@ -1,0 +1,645 @@
+#!/usr/bin/env python
+#
+# qhost
+#
+# Implementation of the Grid Engine "qhost" command atop the
+# Slurm "sinfo," "squeue," and "scontrol" commands.
+#
+
+import sys
+import subprocess
+import re
+import argparse
+
+def str_trunc(s, max_len = -1):
+	"""Truncate a string to a maximum length.
+
+	If max_len is negative or zero, then the full string is returned.
+
+	Otherwise, if the length of s exceeds max_len then s is truncated to (max_len - 1) characters with a plus sign (+) suffix.  Note that if max_len is 1 then the plus sign is omitted and just the first character of s is returned.
+	"""
+	if max_len > 0:
+		if len(s) > max_len:
+			if max_len > 1:
+				return s[0:max_len - 1] + '+'
+			return s[0:max_len]
+	return s
+
+#
+# Borrowed from TACC "pylauncher" code:
+#
+class Hostlist(object):
+	"""Expand a hostlist expression string to a Python list.
+
+	  Example:
+
+	      expand_hostlist("n[9-11],d[01-02]") ==> ['n9', 'n10', 'n11', 'd01', 'd02']
+
+	Unless allow_duplicates is true, duplicates will be purged from the results.
+
+	If sort is true, the output will be sorted.
+	"""
+
+	max_list_length = 10000
+
+	def __init__(self, hostlist, allow_duplicates=False, sort=False):
+		self.hostlist = []
+		bracket_level = 0
+		part = ""
+
+		for c in hostlist + ",":
+			if c == "," and bracket_level == 0:
+				# Comma at top level, split!
+				if part: self.hostlist.extend(Hostlist.expand_part(part))
+				part = ""
+				bad_part = False
+			else:
+				part += c
+
+			if c == "[":
+				bracket_level += 1
+			elif c == "]":
+				bracket_level -= 1
+
+			if bracket_level > 1:
+				raise BadHostlist, "nested brackets"
+			elif bracket_level < 0:
+				raise BadHostlist, "unbalanced brackets"
+
+		if bracket_level > 0:
+			raise BadHostlist, "unbalanced brackets"
+
+		if not allow_duplicates:
+			self.hostlist = Hostlist.remove_duplicates(self.hostlist)
+		if sort:
+			self.hostlist = Hostlist.numerically_sorted(self.hostlist)
+
+	def __len__(self):
+		return len(self.hostlist)
+
+	def __getitem__(self, key):
+		return self.hostlist.__getitem__(key)
+
+	def __iter__(self):
+		return self.hostlist.__iter__()
+
+	@staticmethod
+	def expand_part(s):
+		"""Expand a part (e.g. "x[1-2]y[1-3][1-3]") (no outer level commas)."""
+
+		# Base case: the empty part expand to the singleton list of ""
+		if s == "":
+			return [""]
+
+		# Split into:
+		# 1) prefix string (may be empty)
+		# 2) rangelist in brackets (may be missing)
+		# 3) the rest
+		print s
+		m = re.match(r'([^,\[]*)(\[[^\]]*\])?(.*)', s)
+		(prefix, rangelist, rest) = m.group(1,2,3)
+
+		# Expand the rest first (here is where we recurse!)
+		rest_expanded = Hostlist.expand_part(rest)
+
+		# Expand our own part
+		if not rangelist:
+			# If there is no rangelist, our own contribution is the prefix only
+			us_expanded = [prefix]
+		else:
+			# Otherwise expand the rangelist (adding the prefix before)
+			us_expanded = Hostlist.expand_rangelist(prefix, rangelist[1:-1])
+
+		# Combine our list with the list from the expansion of the rest
+		# (but guard against too large results first)
+		if len(us_expanded) * len(rest_expanded) > Hostlist.max_list_length:
+			raise BadHostlist, "results too large"
+
+		return [us_part + rest_part
+			for us_part in us_expanded
+			for rest_part in rest_expanded]
+
+	@staticmethod
+	def expand_rangelist(prefix, rangelist):
+		""" Expand a rangelist (e.g. "1-10,14"), putting a prefix before."""
+
+		# Split at commas and expand each range separately
+		results = []
+		for range_ in rangelist.split(","):
+			results.extend(Hostlist.expand_range(prefix, range_))
+		return results
+
+	@staticmethod
+	def expand_range(prefix, range_):
+		""" Expand a range (e.g. 1-10 or 14), putting a prefix before."""
+
+		# Check for a single number first
+		m = re.match(r'^[0-9]+$', range_)
+		if m:
+			return ["%s%s" % (prefix, range_)]
+
+		# Otherwise split low-high
+		m = re.match(r'^([0-9]+)-([0-9]+)$', range_)
+		if not m:
+			raise BadHostlist, "bad range"
+
+		(s_low, s_high) = m.group(1,2)
+		low = int(s_low)
+		high = int(s_high)
+		width = len(s_low)
+
+		if high < low:
+			raise BadHostlist, "start > stop"
+		elif high - low > Hostlist.max_list_length:
+			raise BadHostlist, "range too large"
+
+		results = []
+		for i in xrange(low, high+1):
+			results.append("%s%0*d" % (prefix, width, i))
+		return results
+
+	@staticmethod
+	def remove_duplicates(l):
+		"""Remove duplicates from a list (but keep the order)."""
+		results = []
+		for e in l:
+			if e not in results:
+				results.append(e)
+		return results
+
+	@staticmethod
+	def numerically_sorted(l):
+		"""Sort a list of hosts numerically.
+		E.g. sorted order should be n1, n2, n10; not n1, n10, n2.
+		"""
+		return sorted(l, key=Hostlist.numeric_sort_key)
+
+	nsk_re = re.compile("([0-9]+)|([^0-9]+)")
+	@staticmethod
+	def numeric_sort_key(x):
+		return [Hostlist.handle_int_nonint(i_ni) for i_ni in Hostlist.nsk_re.findall(x)]
+
+	@staticmethod
+	def handle_int_nonint(int_nonint_tuple):
+		if int_nonint_tuple[0]:
+			return int(int_nonint_tuple[0])
+		else:
+			return int_nonint_tuple[1]
+
+#
+# The field names passed to sinfo with the --Format flag when
+# fetching node info:
+#
+sinfo_fields = (	'nodeaddr:0',
+			'features_act:0',
+			'cpus:0',
+			'cpusstate:0',
+			'cpusload:0',
+			'sockets:0',
+			'cores:0',
+			'threads:0',
+			'memory:0',
+			'allocmem:0',
+			'freemem:0',
+			'disk:0',
+			'statecompact:0'
+		)
+
+class Node(object):
+	"""Instances of the Node class represent a single host managed by Slurm.
+
+	An instance is primarily composed of instance variables:
+
+		nodeaddr	hostname of the node
+		sockets		number of sockets
+		cores		number of cores per socket
+		threads		number of threads per core
+		state		node state (e.g. idle, down, mixed)
+		is_online	boolean; true if the node is NOT down
+		cpus_total	total CPUs on which jobs can be scheduled
+		cpus_alloc	number of CPUs allocated to jobs
+		cpus_free	number of CPUs not allocated to jobs
+		cpus_other	number of CPUs not used for scheduling
+		processor	type of processor, inferred from feature list
+		load_avg	load average maintained by Slurm; not normalized to 1.0
+		mem_total	total RAM (in megabytes) present in the node
+		mem_alloc	memory (in megabytes) allocated to jobs
+		mem_free	memory (in megabytes) not allocated to jobs
+		tmpdisk_total	megabytes of scratch disk present in the node
+
+	There are instance methods to return unit-tagged memory values and the normalized load.
+	"""
+
+	def __init__(self, spec = None):
+		"""Initialize a newly-allocated Node object using a dictionary of key-value pairs representing the properties of the host.  The keys can be found in the sinfo_fields variable above; they correspond to --Format fields accepted by the sinfo command.
+
+		If the node is in the "down" state, only the nodeaddr, state, sockets, cores, and threads instance variables will be set and the is_online instance variable will be False.
+
+		Otherwise, is_online is True and appopriate values are assigned to the rest of this class's instance variables.
+		"""
+		if isinstance(spec, dict):
+			self.nodeaddr = spec['nodeaddr:0']
+			self.jobs = []
+
+			try:
+				self.sockets = int(spec['sockets:0'])
+				self.cores = int(spec['cores:0'])
+				self.threads = int(spec['threads:0'])
+			except:
+				self.sockets = 0
+				self.cores = 0
+				self.threads = 0
+
+			self.state = spec['statecompact:0']
+			if not 'down' in self.state:
+				self.is_online = True
+
+				cpu_state = spec['cpusstate:0'].split('/')
+				self.cpus_total = int(spec['cpus:0'])
+				self.cpus_alloc = int(cpu_state[0])
+				self.cpus_free = int(cpu_state[1])
+				self.cpus_other = int(cpu_state[2])
+
+				processor = ''
+				for feature in spec['features_act:0'].split(','):
+					if len(feature) > len(processor):
+						processor = feature
+				self.processor = processor
+
+				self.load_avg = float(spec['cpusload:0'])
+
+				self.mem_total = int(spec['memory:0'])
+				self.mem_alloc = int(spec['allocmem:0'])
+				self.mem_free = int(spec['freemem:0'])
+
+				self.tmpdisk_total = int(spec['disk:0'])
+			else:
+				self.is_online = False
+
+				self.cpus_total = 0
+				self.cpus_alloc = 0
+				self.cpus_free = 0
+				self.cpus_other = 0
+
+				self.processor = 'n/a'
+
+				self.load_avg = -1.0
+
+				self.mem_total = 0
+				self.mem_alloc = 0
+				self.mem_free = 0
+
+				self.tmpdisk_total = 0
+		else:
+			raise RuntimeError('node constructor expects a specification dictionary')
+
+	def norm_load(self):
+		"""Returns the normalized load average -- reported load average divided by the number of processor cores."""
+		return self.load_avg / float(self.cpus_total)
+
+	def memory_value(self, field_name, metric = False):
+		"""If the specified field_name is an instance variable of the receiver with a numeric value, treat it as a Slurm memory metric (in megabytes) and convert to an appropriate human-readable value.
+
+		If metric is True, then the prefix divisor will be 1000; otherwise, it is 1024.
+		"""
+		if field_name in self.__dict__:
+			factor = 1000.0 if metric else 1024.0
+			try:
+				v = float(self.__dict__[field_name])
+				u = 'M'
+				if v > factor:
+					v = v / factor
+					u = 'G'
+					if v > factor:
+						v = v / factor
+						u = 'T'
+				return '{0:0.1f}{1}'.format(v, u)
+			except:
+				return ''
+		raise RuntimeError('no field named ' + field_name + ' in Node object')
+
+	def add_job(self, job):
+		self.jobs.append(job)
+
+#
+# The field names passed to squeue with the --Format flag when fetching
+# job info:
+#
+squeue_fields = (	'batchhost',
+			'batchflag',
+			'nodelist',
+			'arrayjobid',
+			'arraytaskid',
+			'prioritylong',
+			'username',
+			'statecompact',
+			'starttime',
+			'partition',
+			'cpuspertask',
+			'numtasks',
+			'numnodes',
+			'numcpus',
+			'sockets',
+			'cores',
+			'threads',
+			'ntpercore',
+			'ntpernode',
+			'ntpersocket',
+			'name'
+		)
+
+class JobInfo(object):
+	"""Instances of the JobInfo class represent Slurm job information.
+
+	An instance is primarily composed of instance variables:
+
+		job_id			Slurm job id
+		task_id			Task id within job
+		master_host		For batch jobs, the host on which the batch script executes
+		is_batch		True if the job is a batch job
+		hosts			List of hosts on which the job executes
+		priority		Integer scheduling priority of the job
+		job_name		Name of the job
+		user_name		Username of the job owner
+		state			State of the job in compact form (e.g. "R")
+		start_time		Date and time when the job began executing
+		partition		Partition in which the job is running
+		ncpus_per_task		Number of CPUs per task
+		ntasks			Number of tasks in job
+		nnodes			Number of nodes allocated to the job
+		ncpus			Number of CPUs allocated to the job
+		nsockets		Requested per-node socket count
+		ncores			Requested per-node core count
+		nthreads		Requested per-node thread count
+		ntasks_per_core		Requested number of tasks per allocated core
+		ntasks_per_node		Requested number of tasks per allocated node
+		ntasks_per_socket	Requested number of tasks per allocated socket
+
+	"""
+
+	def __init__(self, spec = None):
+		"""Initialize a newly-allocated JobInfo object using a dictionary of key-value pairs representing the properties of the job.  The keys can be found in the squeue_fields variable above; they correspond to --Format fields accepted by the squeue command.
+
+		If spec is not a dictionary but instead a JobInfo instance, then the new instance is initialized with the same values contained in the spec JobInfo object.
+
+		Most of the count arguments default to zero if unspecified by the job.
+		"""
+		if isinstance(spec, JobInfo):
+			self.__dict__.update(spec.__dict__)
+		elif isinstance(spec, dict):
+			self.job_id = spec['arrayjobid']
+			self.task_id = '' if (spec['arraytaskid'] == 'N/A') else spec['arraytaskid']
+
+			self.master_host = spec['batchhost']
+			try:
+				self.is_batch = False if (int(spec['batchflag']) == 0) else True
+			except:
+				self.is_batch = False
+
+			self.hosts = Hostlist(spec['nodelist'])
+			self._per_host_records = None
+			self._scontrol_job_info = None
+
+			try:
+				self.priority = int(spec['prioritylong'])
+			except:
+				self.priority = 0
+
+			self.job_name = spec['name']
+			self.user_name = spec['username']
+			self.state = spec['statecompact']
+			self.start_time = spec['starttime']
+			self.partition = spec['partition']
+			try:
+				self.ncpus_per_task = int(spec['cpuspertask'])
+			except:
+				self.ncpus_per_task = 0
+			try:
+				self.ntasks = int(spec['numtasks'])
+			except:
+				self.ntasks = 0
+			try:
+				self.nnodes = int(spec['numnodes'])
+			except:
+				self.nnodes = 0
+			try:
+				self.ncpus = int(spec['numcpus'])
+			except:
+				self.ncpus = 0
+			try:
+				self.nsockets = int(spec['sockets'])
+			except:
+				self.nsockets = 0
+			try:
+				self.ncores = int(spec['cores'])
+			except:
+				self.ncores = 0
+			try:
+				self.nthreads = int(spec['threads'])
+			except:
+				self.nthreads = 0
+			try:
+				self.ntasks_per_core = int(spec['ntpercore'])
+			except:
+				self.ntasks_per_core = 0
+			try:
+				self.ntasks_per_node = int(spec['ntpernode'])
+			except:
+				self.ntasks_per_node = 0
+			try:
+				self.ntasks_per_socket = int(spec['ntpersocket'])
+			except:
+				self.ntasks_per_socket = 0
+		else:
+			raise RuntimeError('job info constructor expects a specification dictionary')
+
+	def task_to_node_mapping(self):
+		"""Load per-node CPU counts for this job using the scontrol utility.  If successful, returns a dictionary mapping node names to CPU counts."""
+		if not self._scontrol_job_info:
+			try:
+				output = subprocess.check_output(['/opt/shared/slurm/bin/scontrol', 'show', 'job', self.job_id, '-dd'])
+				output = output.strip()
+				self._scontrol_job_info = {}
+				for line in output.split('\n'):
+					m = re.match(r'\s*Nodes=(\S+)\s+CPU_IDs=(\S+)',line)
+					if m:
+						hosts = Hostlist(m.group(1))
+						ncpus = len(Hostlist.expand_rangelist('', m.group(2)))
+						for host in hosts:
+							self._scontrol_job_info[host] = ncpus
+
+			except:
+				pass
+		return self._scontrol_job_info
+
+	def per_host_copy(self, nodeaddr):
+		"""Create a copy of this JobInfo instance which inherits the original's attributes but has a single nodeaddr in its hosts list."""
+		copy = JobInfo(self)
+		copy.hosts = Hostlist(nodeaddr)
+		return copy
+
+	def per_host_records(self):
+		"""Return a list of JobInfo objects that represent each participating-host's complement of CPUs."""
+		if len(self.hosts) == 1:
+			return [self]
+
+		if not self._per_host_records:
+			self._per_host_records = []
+			if self.ntasks_per_node > 0:
+				# Each node will have this many tasks, so we don't need additional info:
+				for nodeaddr in self.hosts:
+					per_node = self.per_host_copy(nodeaddr)
+					per_node.ntasks = self.ntasks_per_node
+					self._per_host_records.append(per_node)
+			else:
+				# Use scontrol to get tasks-to-node mappings:
+				task_map = self.task_to_node_mapping()
+				for nodeaddr in self.hosts:
+					per_node = self.per_host_copy(nodeaddr)
+					per_node.ntasks = per_node.ncpus = task_map[nodeaddr]
+					self._per_host_records.append(per_node)
+		return self._per_host_records
+
+#
+# Process command-line arguments:
+#
+arg_parser = argparse.ArgumentParser(
+			description = 'Display host information akin to Grid Engine qhost',
+			epilog = 'A <hostlist> is one or more node names or name patterns (e.g. r00n[00-24]) separated by commas.  A <userlist> is one or more user names separated by commas',
+			add_help = False)
+
+ge_arg_group = arg_parser.add_argument_group('original options', 'options inherited from Grid Engine qhost')
+ge_arg_group.add_argument('-help', action = 'help', help = 'print this help')
+ge_arg_group.add_argument('-h', action = 'append', dest = 'hostlist', metavar = '<hostlist>', help = 'display only selected hosts')
+ge_arg_group.add_argument('-ncb', action = 'store_true', dest = 'show_no_topology', help = 'suppress host topology based information')
+ge_arg_group.add_argument('-j', action = 'store_true', dest = 'show_jobs', help = 'display jobs running on the host(s)')
+ge_arg_group.add_argument('-u', action = 'append', dest = 'userlist', metavar = '<username>', help = 'show only jobs for user')
+
+extended_arg_group = arg_parser.add_argument_group('extended options', 'additional options not present in Grid Engine qhost')
+extended_arg_group.add_argument('--help', action = 'help', help = 'alternate to -help')
+extended_arg_group.add_argument('--hosts', action = 'append', dest = 'hostlist', metavar = '<hostlist>', help = 'alternate to -h')
+extended_arg_group.add_argument('--jobs', action = 'store_true', dest = 'show_jobs', help = 'alternate to -j')
+extended_arg_group.add_argument('--users', action = 'append', dest = 'userlist', metavar = '<userlist>', help = 'alternate to -u')
+extended_arg_group.add_argument('--no-node-sort', '-S', action = 'store_true', dest = 'no_node_sort', help = 'do not sort the list of nodes by name before displaying')
+extended_arg_group.add_argument('--std-host-topo', '-T', action = 'store_true', dest = 'std_host_topo', help = 'show host topology as sockets, cores-per-socket, and threads-per-core')
+
+argv = arg_parser.parse_args()
+
+#
+# Use the sinfo command to get the list of nodes with their attributes:
+#
+sinfo_cmd = ['/opt/shared/slurm/bin/sinfo', '--noheader', '--parseable' ]
+sinfo_cmd.extend(('--Format', ','.join(sinfo_fields)))
+if argv.hostlist:
+	sinfo_cmd.extend(('--node', ','.join(argv.hostlist)))
+node_list = {}
+try:
+	output = subprocess.check_output(sinfo_cmd, stderr=subprocess.STDOUT)
+except subprocess.CalledProcessError as E:
+	sys.stderr.write('ERROR:  failed to execute sinfo (rc = {}): {}\n'.format(E.returncode, E.output))
+except Exception as E:
+	sys.stderr.write('ERROR:  failed to execute sinfo: ' + str(E) + '\n')
+
+#
+# Process the output from sinfo to create Node objects:
+#
+for line in output.split('\n'):
+	line = line.strip()
+	if line:
+		components = line.split('|')
+		if len(components) == len(sinfo_fields):
+			try:
+				new_node = Node(dict(zip(sinfo_fields, components)))
+				if new_node.nodeaddr not in node_list:
+					node_list[new_node.nodeaddr] = new_node
+			except Exception as E:
+				sys.stderr.write('WARNING:  failed parsing info for {}: {}\n'.format(components[0], str(E)))
+		else:
+			sys.stderr.write('WARNING:  invalid node info line:  ' + line + '\n')
+
+#
+# So long as we got a list of nodes, continue on:
+#
+if node_list:
+	if argv.show_jobs:
+		#
+		# Generate a job list for the nodes:
+		#
+		squeue_cmd = ['/opt/shared/slurm/bin/squeue', '--noheader', '--parseable', '--states=R,PD,CF,CG,RQ,RS,NF,ST,S', '--Format', ','.join(squeue_fields) ]
+		if argv.hostlist:
+			squeue_cmd.extend(('--nodelist', ','.join(argv.hostlist)))
+		if argv.userlist:
+			squeue_cmd.extend(('--user', ','.join(argv.userlist)))
+		try:
+			output = subprocess.check_output(squeue_cmd).strip()
+		except subprocess.CalledProcessError as E:
+			sys.stderr.write('ERROR:  failed to execute squeue (rc = {}): {}\n'.format(E.returncode, E.outout))
+		except Exception as E:
+			sys.stderr.write('ERROR:  failed to execute squeue ({}): {}\n'.format(E.__class__, str(E)))
+		for line in output.strip().split('\n'):
+			line = line.strip()
+			if line:
+				# Since the final field -- job name -- could have whitespace, limit
+				# the number of splits to the number of fields minus one (which would
+				# yield at most number-of-fields components):
+				components = line.split('|', len(squeue_fields) - 1)
+				if len(components) == len(squeue_fields):
+					#try:
+						job_info = JobInfo(dict(zip(squeue_fields, components)))
+						# Grab per-node records:
+						for per_node_job_info in job_info.per_host_records():
+							if per_node_job_info.hosts[0] in node_list:
+								node_list[per_node_job_info.hosts[0]].add_job(per_node_job_info)
+							else:
+								sys.stderr.write('WARNING:  invalid line:  ' + line + '\n')
+					#except Exception as E:
+					#	sys.stderr.write('WARNING:  failed parsing job info for {}: {}\n'.format(components[3], str(E)))
+				else:
+					sys.stderr.write('WARNING:  invalid job info line:  ' + line + '\n')
+
+
+	if argv.show_no_topology:
+		hfstr = '{0:24s}{1:12s}{2:>5s}{6:>6s}{7:>8s}{8:>8s}{9:>8s}{10:>8s}'
+		nf1str = '{0:24s}{1:12s}{2:5d}'
+	else:
+		hfstr = '{0:24s}{1:12s}{2:>5s}{3:>5s}{4:>5s}{5:>5s}{6:>6s}{7:>8s}{8:>8s}{9:>8s}{10:>8s}'
+		nf1str = '{0:24s}{1:12s}{2:5d}{3:5d}{4:5d}{5:5d}'
+	print hfstr.format('HOSTNAME', 'ARCH', 'NCPU', 'NSOC', 'NCOR', 'NTHR', 'NLOAD', 'MEMTOT', 'MEMUSE', 'SWAPTO', 'SWAPUS')
+	print '-'*(24+12+5+5+5+5+6+8+8+8+8)
+
+	#
+	# Get node names present and sort them for display (if desired):
+	#
+	node_names = node_list.keys()
+	if not argv.no_node_sort:
+		node_names.sort()
+	for node_name in node_names:
+		node = node_list[node_name]
+		if argv.std_host_topo:
+			output = nf1str.format(node.nodeaddr, node.processor, node.cpus_total, node.sockets, node.cores, node.threads)
+		else:
+			output = nf1str.format(node.nodeaddr, node.processor, node.cpus_total, node.sockets, node.sockets * node.cores, node.sockets * node.cores * node.threads)
+		if node.is_online:
+			output = output + '{0:6.2f}{1:>8s}{2:>8s}{3:>8s}{4:>8s}'.format(node.norm_load(), node.memory_value('mem_total'), node.memory_value('mem_alloc'), '0.0', '0.0')
+		print output
+
+		if argv.show_jobs and len(node.jobs) > 0:
+			print '  {0:>12s} {1:>12s} {2:16s} {3:8s} {4:5s} {5:22s} {6:12s} {7:6s} {8:>12s}'.format(
+					'job-ID', 'prior', 'name', 'user', 'state', 'submit/start at', 'queue', 'master', 'ja-task-ID'
+				)
+			print '  ' + '-'*(12+1+12+1+16+1+8+1+5+1+22+1+12+1+6+1+12)
+			for job in node.jobs:
+				print '  {0:>12s} {1:>12d} {2:16s} {3:8s} {4:^5s} {5:22s} {6:12s} {7:6s} {8:>12s}'.format(
+						job.job_id,
+						job.priority,
+						str_trunc(job.job_name, 16),
+						str_trunc(job.user_name, 12),
+						job.state,
+						str_trunc(job.start_time, 22),
+						str_trunc(job.partition, 12),
+						'MASTER' if (not job.is_batch or (job.master_host in job.hosts)) else 'SLAVE',
+						job.task_id
+					)
+				if job.ntasks > 1:
+					for _ in xrange(job.ntasks - 1):
+						print '  ' + ' '*(12+1+12+1+16+1+8+1+5+1+22+1+12+1) + '{0:6s} {1:>12s}'.format('SLAVE' if job.is_batch else 'MASTER', job.task_id)

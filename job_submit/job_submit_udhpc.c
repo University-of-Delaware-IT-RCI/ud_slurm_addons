@@ -97,58 +97,60 @@ __has_owned_resource_partition(
   const char  *partition_list
 )
 {
-  char        *base = (char*)partition_list;
-  
-  while ( *base ) {
-    char      *p = base;
+  if ( partition_list ) {
+    char        *base = (char*)partition_list;
     
-    if ( xstrncasecmp(base, "compute", 7) == 0 ) {
-      p += 7;
-    } else if ( xstrncasecmp(base, "gpu", 3) == 0 ) {
-      p += 3;
-    } else if ( xstrncasecmp(base, "gpu", 3) == 0 ) {
-      p += 3;
-    }
-    if ( p > base ) {
-      int     unit_char = 0;
-      int     byte_char = 0;
+    while ( *base ) {
+      char      *p = base;
       
-      /* Format for partition names is <type>-<size><unit> */
-      if ( *p == '-' ) {
-        p++;
-        /* Digits: */
-        while ( *p && isdigit(*p) ) p++;
+      if ( xstrncasecmp(base, "compute", 7) == 0 ) {
+        p += 7;
+      } else if ( xstrncasecmp(base, "gpu", 3) == 0 ) {
+        p += 3;
+      } else if ( xstrncasecmp(base, "gpu", 3) == 0 ) {
+        p += 3;
+      }
+      if ( p > base ) {
+        int     unit_char = 0;
+        int     byte_char = 0;
+        
+        /* Format for partition names is <type>-<size><unit> */
+        if ( *p == '-' ) {
+          p++;
+          /* Digits: */
+          while ( *p && isdigit(*p) ) p++;
 next_unit_char:
-        switch (*p) {
-          case 'P':
-          case 'p':
-          case 'T':
-          case 't':
-          case 'G':
-          case 'g':
-          case 'M':
-          case 'm':
-            p++;
-            unit_char++;
-            goto next_unit_char;
-          case 'b':
-          case 'B':
-            p++;
-            byte_char++;
-            goto next_unit_char;
-          case ',':
-          case '\0':
-            if ( (unit_char == 1) && (byte_char == 1) ) return true;
-          default:
-            break;
+          switch (*p) {
+            case 'P':
+            case 'p':
+            case 'T':
+            case 't':
+            case 'G':
+            case 'g':
+            case 'M':
+            case 'm':
+              p++;
+              unit_char++;
+              goto next_unit_char;
+            case 'b':
+            case 'B':
+              p++;
+              byte_char++;
+              goto next_unit_char;
+            case ',':
+            case '\0':
+              if ( (unit_char == 1) && (byte_char == 1) ) return true;
+            default:
+              break;
+          }
         }
       }
-    }
-    p = xstrchr(p, ',');
-    if ( p ) {
-      base = p + 1;
-    } else {
-      break;
+      p = xstrchr(p, ',');
+      if ( p ) {
+        base = p + 1;
+      } else {
+        break;
+      }
     }
   }
   return false;

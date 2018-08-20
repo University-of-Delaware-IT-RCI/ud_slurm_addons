@@ -1,0 +1,177 @@
+#!/usr/bin/python
+#
+# sjobs
+#
+# A wrapper to squeue to use an appropriate set of default arguments and
+# display information in what we deem a more useful format.
+#
+
+import os
+import sys
+import subprocess
+import re
+import argparse
+
+def parse_memory(mem_value):
+	v = 0
+	for c in mem_value:
+		if c >= '0' and c <= '9':
+			v = (v * 10) + (ord(c) - ord('0'))
+		else:
+			if c == 'G':
+				v *= 1024
+			elif c == 'T':
+				v *= 1024 * 1024
+			elif c == 'P':
+				v *= 1024 * 1024 * 1024
+			break
+	return v
+
+
+#
+# Process command-line arguments:
+#
+arg_parser = argparse.ArgumentParser(
+			description = 'Display information for running and queued jobs',
+			epilog = 'If no job selection options are provided then jobs for the current user will be displayed.')
+
+select_arg_group = arg_parser.add_argument_group('job selection options')
+select_arg_group.add_argument('-a', '--all',
+	action = 'store_true',
+	dest = 'showAllUsers',
+	help = 'show all users (not just yourself)')
+select_arg_group.add_argument('-G', '--current-group',
+	action = 'store_true',
+	default = False,
+	dest = 'showCurrentWorkgroup',
+	help = 'show jobs for users in your current workgroup')
+select_arg_group.add_argument('-g', '--group',
+	action = 'append',
+	dest = 'groupList',
+	metavar = '<workgroup>',
+	help = 'show jobs for users in the given workgroup (can be used multiple times)')
+select_arg_group.add_argument('-u', '--user',
+	action = 'append',
+	dest = 'userList',
+	metavar = '<username>',
+	help = 'show jobs for the given user (can be used multiple times)')
+
+output_arg_group = arg_parser.add_argument_group('output options')
+output_arg_group.add_argument('-t', '--totals',
+	action = 'store_true',
+	default = False,
+	dest = 'showTotals',
+	help = 'show total jobs, users, groups, cpus, nodes, and tasks')
+output_arg_group.add_argument('-H', '--no-header',
+	action = 'store_true',
+	default = False,
+	dest = 'showNoHeader',
+	help = 'do not show column headers')
+output_arg_group.add_argument('--parseable',
+	action = 'store_true',
+	default = False,
+	dest = 'showParseable',
+	help = 'do not display in a tabular format')
+output_arg_group.add_argument('-d', '--delimiter',
+	default = '|',
+	dest = 'delimiter',
+	metavar = '<string>',
+	help = 'when --parseable is selected, separate columns with this string')
+argv = arg_parser.parse_args()
+
+#
+# Create squeue command:
+#
+key_list = ['jobid', 'user', 'state', 'jobname', 'group', 'ncpus', 'nnodes', 'ntasks']
+align_list = '><^<<>>>'
+squeue_args = ['/opt/shared/slurm/bin/squeue', '--parseable', '--delimiter=:|:', '--noheader', '--Format=jobarrayid,username,state,name,account,numcpus,numnodes,numtasks']
+if not argv.showAllUsers:
+	import grp
+
+	if argv.showCurrentWorkgroup:
+		squeue_args.append('--account')
+		squeue_args.append(grp.getgrgid(os.getgid()).gr_name)
+	elif argv.groupList is not None and len(argv.groupList) > 0:
+		squeue_args.append('--account')
+		squeue_args.append(','.join(argv.groupList))
+	else:
+		squeue_args.append('--user')
+		squeue_args.append(os.getlogin())
+
+try:
+	output = subprocess.check_output(squeue_args)
+	#
+	# Generate job list from the output:
+	#
+	job_list = []
+	field_widths = map(lambda f: len(f), key_list)
+	users = []
+	accounts = []
+	if argv.showTotals:
+		totals = [0, 0, '', '', 0, 0, 0, 0]
+	for line in output.split('\n'):
+		if line:
+			job_rec = line.split(':|:')
+			if argv.showTotals:
+				totals[0] = totals[0] + 1
+				if job_rec[1] not in users:
+					users.append(job_rec[1])
+					totals[1] = totals[1] + 1
+				if job_rec[4] not in accounts:
+					accounts.append(job_rec[4])
+					totals[4] = totals[4] + 1
+				totals[5] = totals[5] + int(job_rec[5])
+				totals[6] = totals[6] + int(job_rec[6])
+				totals[7] = totals[7] + int(job_rec[7])
+			i = 0
+			while i < len(job_rec):
+				if len(job_rec[i]) > field_widths[i]:
+					field_widths[i] = len(job_rec[i])
+				i = i + 1
+			job_list.append(job_rec)
+	if argv.showTotals:
+		i = 0
+		while i < len(totals):
+			totals[i] = str(totals[i])
+			if len(totals[i]) > field_widths[i]:
+				field_widths[i] = len(totals[i])
+			i = i + 1
+
+	#
+	# Did we get any jobs?
+	#
+	if len(job_list) > 0:
+		if not argv.showParseable:
+			header_format = ''
+			job_format = ''
+			sep_list = []
+			i = 0
+			while i < len(field_widths):
+				header_format = header_format + (' ' if len(header_format) > 0 else '') + '{{{0:d}:{1:s}{2:d}s}}'.format(i, align_list[i], field_widths[i])
+				job_format = job_format + (' ' if len(job_format) > 0 else '') + '{{{0:d}:{1:s}{2:d}s}}'.format(i, align_list[i], field_widths[i])
+				sep_list.append('-'*field_widths[i])
+				i = i + 1
+		if not argv.showNoHeader:
+			if argv.showParseable:
+				print argv.delimiter.join(map(lambda f:f.upper(), key_list))
+			else:
+				print header_format.format(*map(lambda f:f.upper(), key_list))
+				print header_format.format(*sep_list)
+		if argv.showParseable:
+			for job in job_list:
+				print argv.delimiter.join(job)
+
+		else:
+			for job in job_list:
+				print job_format.format(*job)
+		if argv.showTotals:
+			if argv.showParseable:
+				print argv.delimiter.join(totals)
+			else:
+				print header_format.format(*sep_list)
+				print job_format.format(*totals)
+
+except subprocess.CalledProcessError as E:
+	sys.stderr.write('ERROR:  failed to execute squeue (rc = {}): {}\n'.format(E.returncode, E.output))
+except Exception as E:
+	sys.stderr.write('ERROR:  failed to execute squeue: ' + str(E) + '\n')
