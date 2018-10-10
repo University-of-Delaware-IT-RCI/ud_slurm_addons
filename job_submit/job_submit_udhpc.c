@@ -107,8 +107,8 @@ __has_owned_resource_partition(
         p += 7;
       } else if ( xstrncasecmp(base, "gpu", 3) == 0 ) {
         p += 3;
-      } else if ( xstrncasecmp(base, "gpu", 3) == 0 ) {
-        p += 3;
+      } else if ( xstrncasecmp(base, "nvme", 4) == 0 ) {
+        p += 4;
       }
       if ( p > base ) {
         int     unit_char = 0;
@@ -1149,6 +1149,19 @@ job_submit(
       }
     }
   }
+  
+  /* If submitted against the "reserved" partition, then a reservation
+   * must be provided, too:
+   */
+  if ( job_desc->partition && (strcasecmp(job_desc->partition, "reserved") == 0) ) {
+    if ( ! job_desc->reservation || (strlen(job_desc->reservation) <= 0) ) {
+      info(PLUGIN_SUBTYPE ": reserved partition selected, no reservation provided");
+      if ( err_msg ) {
+        *err_msg = xstrdup("Jobs in the `reserved` partition require a reservation");
+      }
+      return SLURM_ERROR;
+    }
+  }
 
   /* Memory limit _must_ be set: */
   if ( (job_desc->pn_min_memory <= 0) || (job_desc->pn_min_memory == NO_VAL64) ) {
@@ -1258,6 +1271,12 @@ job_submit(
         info(PLUGIN_SUBTYPE ": GRES requested, no partition indicated so defaulting to gpu-128GB");
       }
     }
+  }
+  
+  /* Ensure that an empty time-min is set to time-limit: */
+  if ( job_desc->time_min == NO_VAL ) {
+    job_desc->time_min = job_desc->time_limit;
+    info(PLUGIN_SUBTYPE ": time_min is empty, setting to time_limit");
   }
   
   return SLURM_SUCCESS;

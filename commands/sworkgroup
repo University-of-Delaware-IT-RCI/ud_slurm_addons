@@ -1,0 +1,232 @@
+#!/usr/bin/env python
+#
+# sworkgroup
+#
+# Show Slurm partitions and limits for a workgroup.
+#
+
+import os
+import sys
+import re
+import grp
+import subprocess
+import argparse
+
+SLURM_PREFIX = '/opt/shared/slurm/bin'
+
+cached_qos_defs = {}
+def get_qos_definition(qos_name):
+	if qos_name in cached_qos_defs:
+		return cached_qos_defs[qos_name]
+
+	try:
+		output = subprocess.check_output(
+				(os.path.join(SLURM_PREFIX, 'sacctmgr'), '--parsable2', 'show', 'qos', qos_name)
+			)
+	except:
+		return None
+	# First line is the labels, second is values:
+	output = output.splitlines()
+	labels = output[0].split('|')
+	values = output[1].split('|')
+	cached_qos_defs[qos_name] = dict(zip(labels, values))
+	return cached_qos_defs[qos_name]
+
+
+def human_readable_tres(tres):
+	if not cli_args.human_readable:
+		return tres
+
+	hr_form = ''
+	for piece in tres.split(','):
+		if piece.startswith('node='):
+			hr_form += (', ' if hr_form else '') + piece[5:] + ' nodes'
+		elif piece.startswith('cpu='):
+			hr_form += (', ' if hr_form else '') + piece[4:] + ' cores'
+		elif piece.startswith('gres/gpu:'):
+			gpu = piece[9:].split('=')
+			hr_form += (', ' if hr_form else '') + '{0:s} {1:s} GPUs'.format(gpu[1], gpu[0])
+	return hr_form
+
+
+cli_parser = argparse.ArgumentParser(description='Show Slurm partitions and limits for a workgroup')
+cli_parser.add_argument(
+		'--workgroup', '-g', metavar='group', dest='workgroup',
+		help='display partitions available to a specific workgroup'
+	)
+cli_parser.add_argument(
+		'--limits', '-l', dest='show_tres', action='store_true',
+		help='show TRES limits for each partition'
+	)
+cli_parser.add_argument(
+		'--noheader', '-N', dest='no_header', action='store_true',
+		help='do not display column headers on output'
+	)
+cli_parser.add_argument(
+		'--human-readable', '-H', dest='human_readable', action='store_true',
+		help='show TRES in a more human-readable format'
+	)
+cli_parser.add_argument(
+		'--parseable', dest='parseable', action='store_true',
+		help='show as parseable lines rather than a tabular format'
+	)
+
+
+cli_args = cli_parser.parse_args()
+
+#
+# Figure out what group we're interested in:
+#
+try:
+	if cli_args.workgroup is None:
+		target_group = grp.getgrgid(os.getgid())
+	else:
+		target_group = grp.getgrnam(cli_args.workgroup)
+except Exception as E:
+	print "ERROR:  " + str(E)
+	sys.exit(1)
+
+#
+# Is the target group an account?
+#
+try:
+	output = subprocess.check_output(
+		(os.path.join(SLURM_PREFIX, 'sacctmgr'), '--noheader', '--parsable', 'list', 'account', target_group.gr_name)
+	)
+	output = output.strip()
+except Exception as E:
+	print "ERROR:  " + str(E)
+	sys.exit(1)
+if not output:
+	print "ERROR:  '{0:s}' is not a Slurm account".format(target_group.gr_name)
+target_account = target_group.gr_name
+
+#
+# Retrieve a list of partitions:
+#
+try:
+	output = subprocess.check_output(
+		(os.path.join(SLURM_PREFIX, 'scontrol'), 'show', 'partitions')
+	)
+except Exception as E:
+	print "ERROR:  " + str(E)
+	sys.exit(1)
+partitions = {}
+partition_name = None
+partition_dict = {}
+keyvalue_regex = re.compile(r"([^=]+)=(\S+)")
+for line in output.splitlines():
+	line = line.strip()
+	if not line:
+		if partition_name:
+			partitions[partition_name] = partition_dict
+		partition_name = None
+	elif line.startswith('PartitionName='):
+		partition_name = line[len('PartitionName='):]
+		partition_dict = {}
+	elif partition_name:
+		for keyvalue in line.split():
+			m = keyvalue_regex.match(keyvalue)
+			if m is not None:
+				partition_dict[m.group(1)] = m.group(2)
+
+#
+# Let's present the list of partitions in order:
+#
+partition_names = partitions.keys()
+partition_names.sort()
+if cli_args.show_tres:
+	output_headers = ['Partition', 'Per user', 'Per job', 'Per workgroup']
+else:
+	output_headers = ['Partition']
+output_lines = []
+output_widths = [ len(v) for v in output_headers ]
+
+for partition_name in partition_names:
+	accessGranted = False
+	#
+	# Is the target group in the AllowQos list?
+	#
+	allowQos = partitions[partition_name]['AllowQos'].split(',')
+	if target_account in allowQos:
+		accessGranted = True
+	elif 'normal' in allowQos:
+		#
+		# Check for account-based access:
+		#
+		allowAccounts = partitions[partition_name]['AllowAccounts'].split(',')
+		if 'ALL' in allowAccounts or target_account in allowAccounts:
+			accessGranted = True
+
+	if accessGranted:
+		if cli_args.show_tres:
+			line = [partition_name, '', '', '']
+			#
+			# Is there a baseline QOS on this partition?
+			#
+			if partitions[partition_name]['QoS'] <> 'N/A':
+				qos = get_qos_definition(partitions[partition_name]['QoS'])
+				#
+				# MaxJobs per user?
+				#
+				if qos['MaxJobsPU']:
+					line[1] += (', ' if line[1] else '') + '{0:d} jobs'.format(int(qos['MaxJobsPU']))
+				#
+				# MaxTRES per user?
+				#
+				if qos['MaxTRESPU']:
+					line[1] += (', ' if line[1] else '') + human_readable_tres(qos['MaxTRESPU'])
+				#
+				# MaxTRES per job?
+				#
+				if qos['MaxTRES']:
+					line[2] += (', ' if line[2] else '') + human_readable_tres(qos['MaxTRES'])
+
+			#
+			# Are there workgroup QOS limits on this partition?
+			#
+			if target_account in allowQos:
+				qos = get_qos_definition(target_account)
+				if qos['GrpTRES']:
+					line[3] += (', ' if line[3] else '') + human_readable_tres(qos['GrpTRES'])
+
+			# Widths on fields:
+			if not cli_args.parseable:
+				for i in range(len(line)):
+					if len(line[i]) > output_widths[i]:
+						output_widths[i] = len(line[i])
+			output_lines.append(line)
+		else:
+			if not cli_args.parseable:
+				if len(partition_name) > output_widths[0]:
+					output_widths[0] = len(partition_name)
+			output_lines.append([partition_name])
+
+#
+# Generate the format strings:
+#
+output_format = ''
+separator_format = ''
+separators = []
+if cli_args.parseable:
+	for i in range(len(output_headers)):
+		output_format += ('|' if output_format else '') + '{{{0:d}:s}}'.format(i)
+else:
+	for width in output_widths:
+		if output_format:
+			output_format += ' '
+			separator_format += '+'
+		output_format += '{:' + str(width) + 's}'
+		separator_format += '{:' + str(width) + 's}'
+		separators.append('-'*width)
+
+#
+# Output partition info:
+#
+if not cli_args.no_header:
+	print output_format.format(*output_headers)
+	if not cli_args.parseable:
+		print separator_format.format(*separators)
+for line in output_lines:
+	print output_format.format(*line)
+
