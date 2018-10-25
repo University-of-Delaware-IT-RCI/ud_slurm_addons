@@ -61,39 +61,6 @@ static int gecompat_opt_add_sge_env(
 }
 
 /*
- * @function gecompat_getgrgid
- *
- * Map a numeric gid_t to its string form.
- *
- */
-char*
-gecompat_getgrgid(
-  gid_t           the_gid
-)
-{
-  struct group    *group_info = getgrgid(the_gid);
-  
-  return ( group_info ) ? group_info->gr_name : NULL;
-}
-
-/*
- * @function gecompat_opt_add_workgroup_partition
- *
- * Parse the --workgroup option.
- *
- */
-static int gecompat_opt_add_workgroup_partition(
-  int         val,
-  const char  *optarg,
-  int         remote
-)
-{
-  setenv("GECOMPAT_SET_WORKGROUP_PARTITION", "1", 1);
-  slurm_verbose("gridengine_compat:  set GECOMPAT_WORKGROUP_FLAG in environment");
-  return ESPANK_SUCCESS;
-}
-
-/*
  * Options available to this spank plugin:
  */
 struct spank_option spank_options_allocator[] =
@@ -101,10 +68,6 @@ struct spank_option spank_options_allocator[] =
     { "add-sge-env", NULL,
       "Add GridEngine equivalents of SLURM job environment variables.",
       0, 0, (spank_opt_cb_f) gecompat_opt_add_sge_env },
-    
-    { "workgroup", NULL,
-      "Submit the job to the workgroup partition associate with the account on the job.",
-      0, 0, (spank_opt_cb_f) gecompat_opt_add_workgroup_partition },
       
     SPANK_OPTIONS_TABLE_END
 };

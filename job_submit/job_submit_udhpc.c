@@ -37,48 +37,61 @@ const uint64_t udhpc_min_mem_mb = UDHPC_MIN_MEM_MB;
 
 
 char*
-job_submit_udhpc_getgrgid(
+job_submit_getgrgid(
   gid_t           the_gid
 )
 {
-  struct group    group_info, *group_info_ptr = NULL;
-  char            *out_gname = NULL;
+  static int      is_cached = 0;
+  static gid_t    cached_gid = 0;
+  static char     cached_gname[64];
   
+  char*           out_gname = NULL;
+  
+  /* Return the cached gname if applicable: */
+  if ( ! is_cached || (cached_gid != the_gid) ) {
+    struct group  group_info, *group_info_ptr = NULL;
 #ifdef _SC_GETGR_R_SIZE_MAX
-  size_t          gid_str_buffer_len = sysconf(_SC_GETGR_R_SIZE_MAX);
+    size_t        gid_str_buffer_len = sysconf(_SC_GETGR_R_SIZE_MAX);
 #else
-  size_t          gid_str_buffer_len = 1024;
+    size_t        gid_str_buffer_len = 1024;
 #endif
-  char            *gid_str_buffer = xmalloc_nz(gid_str_buffer_len);
-  
-  if ( gid_str_buffer ) {
-    while ( 1 ) {
-      if ( getgrgid_r(the_gid, &group_info, gid_str_buffer, gid_str_buffer_len, &group_info_ptr) != 0 ) {
-        /* Failure -- errno will tell us what went wrong: */
-        if ( (errno == ERANGE) && (gid_str_buffer_len < 64 * 1024) ) {
-          /* Resize the buffer and try again: */
-          char    *resized_buffer = xrealloc_nz(gid_str_buffer, gid_str_buffer_len + 1024);
-          
-          if ( resized_buffer ) {
-            gid_str_buffer = resized_buffer;
-            gid_str_buffer_len += 1024;
-            continue;
+    char          *gid_str_buffer = xmalloc_nz(gid_str_buffer_len);
+    
+    if ( gid_str_buffer ) {
+      while ( 1 ) {
+        if ( getgrgid_r(the_gid, &group_info, gid_str_buffer, gid_str_buffer_len, &group_info_ptr) != 0 ) {
+          /* Failure -- errno will tell us what went wrong: */
+          if ( (errno == ERANGE) && (gid_str_buffer_len < 64 * 1024) ) {
+            /* Resize the buffer and try again: */
+            char    *resized_buffer = xrealloc_nz(gid_str_buffer, gid_str_buffer_len + 1024);
+            
+            if ( resized_buffer ) {
+              gid_str_buffer = resized_buffer;
+              gid_str_buffer_len += 1024;
+              continue;
+            }
           }
+        } else if ( group_info_ptr ) {
+          /* Success! */
+          if ( strlen(group_info_ptr->gr_name) >= sizeof(cached_gname) ) return NULL;
+          strncpy(cached_gname, group_info_ptr->gr_name, sizeof(cached_gname));
+          cached_gid = the_gid;
+          is_cached = 1;
+          out_gname = cached_gname;
         }
-      } else if ( group_info_ptr ) {
-        /* Success! */
-        out_gname = xstrdup(group_info_ptr->gr_name);
+        break;
       }
-      break;
+      xfree(gid_str_buffer);
     }
-    xfree(gid_str_buffer);
+  } else {
+    out_gname = cached_gname;
   }
   return out_gname;
 }
 
 
 extern bool
-__is_nonempty_str(
+job_submit_is_nonempty_str(
   const char    *s
 )
 {
@@ -92,8 +105,86 @@ __is_nonempty_str(
 }
 
 
+extern char*
+job_submit_xstrcasestr_wrapper(
+  const char    *haystack,
+  const char    *needle
+)
+{
+  return xstrcasestr((char*)haystack, (char*)needle);
+}
+
+
 extern bool
-__has_owned_resource_partition(
+job_submit_str_in_list(
+  const char    *haystack,
+  const char    *needle,
+  bool          fold_case
+)
+{
+  char*         (*search_fn)(const char *, const char *) = (fold_case ? job_submit_xstrcasestr_wrapper : xstrstr);
+  const char    *p = haystack;
+  size_t        needle_len = strlen(needle);
+  
+  while ( *p && (p = search_fn(p, needle)) ) {
+    /* haystack starts with the needle */
+    if ( (p == haystack) && ((p[needle_len] == ',') || (p[needle_len] == '\0')) ) return true;
+    
+    /* not at the start, so we must be preceded by a comma... */
+    if ( p[-1] == ',' ) {
+      /* ...and end with a comma or NUL: */
+      if ( (p[needle_len] == ',') || (p[needle_len] == '\0') ) return true;
+    }
+    p += needle_len;
+    while ( *p && (*p != ',') ) p++;
+    while ( *p == ',' ) p++;
+  }
+  return false;
+}
+
+
+extern char*
+job_submit_replace_str_in_list(
+  const char    *haystack,
+  const char    *needle,
+  const char    *replacement,
+  bool          fold_case
+)
+{
+  char*         (*search_fn)(const char *, const char *) = (fold_case ? job_submit_xstrcasestr_wrapper : xstrstr);
+  const char    *p = haystack;
+  size_t        needle_len = strlen(needle);
+  
+  while ( *p && (p = search_fn(p, needle)) ) {
+    /* haystack starts with the needle */
+    if ( (p == haystack) && ((p[needle_len] == ',') || (p[needle_len] == '\0')) ) {
+      char      *out_str = xstrdup(replacement);
+      
+      if ( p[needle_len] ) xstrcat(out_str, p + needle_len);
+      return out_str;
+    }
+    
+    /* not at the start, so we must be preceded by a comma... */
+    if ( p[-1] == ',' ) {
+      /* ...and end with a comma or NUL: */
+      if ( (p[needle_len] == ',') || (p[needle_len] == '\0') ) {
+        char    *out_str = xstrndup(haystack, p - haystack);
+        
+        xstrcat(out_str, replacement);
+        if ( p[needle_len] ) xstrcat(out_str, p + needle_len);
+        return out_str;
+      }
+    }
+    p += needle_len;
+    while ( *p && (*p != ',') ) p++;
+    while ( *p == ',' ) p++;
+  }
+  return NULL;
+}
+
+
+extern bool
+job_submit_has_owned_resource_partition(
   const char  *partition_list
 )
 {
@@ -157,26 +248,6 @@ next_unit_char:
 }
 
 
-extern int
-job_submit_strncasecmp(
-  const char    *s1,
-  const char    *s2,
-  size_t        l
-)
-{
-  while ( l-- ) {
-    if ( *s1 && *s2 ) {
-      if (tolower(*s1) != tolower(*s2)) return (tolower(*s2) - tolower(*s1));
-      s1++; s2++;
-    } else {
-      if ( *s1 != *s2 ) return (tolower(*s2) - tolower(*s1));
-      break;
-    }
-  }
-  return 0;
-}
-
-
 static inline int
 job_submit_resource_name_equal(
   const char    *s,
@@ -184,7 +255,7 @@ job_submit_resource_name_equal(
   const char    *d
 )
 {
-  return (job_submit_strncasecmp(s, d, l) == 0) ? 1 : 0;
+  return (xstrncasecmp(s, d, l) == 0) ? 1 : 0;
 }
 
 
@@ -196,8 +267,8 @@ job_submit_resource_name_in_pair(
   const char    *d2
 )
 {
-  if ( job_submit_strncasecmp(s, d1, l) == 0 ) return 1;
-  return (job_submit_strncasecmp(s, d2, l) == 0) ? 1 : 0;
+  if ( xstrncasecmp(s, d1, l) == 0 ) return 1;
+  return (xstrncasecmp(s, d2, l) == 0) ? 1 : 0;
 }
 
 
@@ -213,7 +284,7 @@ job_submit_resource_name_in_set(
   
   va_start(vargs, l);
   while ( (d = va_arg(vargs, const char*)) ) {
-    if ( job_submit_strncasecmp(s, d, l) == 0 ) return 1;
+    if ( xstrncasecmp(s, d, l) == 0 ) return 1;
   }
   va_end(vargs);
   return 0;
@@ -1142,7 +1213,7 @@ job_submit(
    * (if present) and for SGE compatibility check for
    * directives:
    */
-  if ( __is_nonempty_str(job_desc->script) ) {
+  if ( job_submit_is_nonempty_str(job_desc->script) ) {
     /* Must start with hash-bang: */
     if ( strncmp(job_desc->script, "#!", 2) == 0 ) {
       debug(PLUGIN_SUBTYPE ": checking for SGE flags in script");
@@ -1157,8 +1228,8 @@ job_submit(
   /* If submitted against the "reserved" partition, then a reservation
    * must be provided, too:
    */
-  if ( job_desc->partition && (strcasecmp(job_desc->partition, "reserved") == 0) ) {
-    if ( ! job_desc->reservation || (strlen(job_desc->reservation) <= 0) ) {
+  if ( job_submit_is_nonempty_str(job_desc->partition) && (job_submit_str_in_list(job_desc->partition, "reserved", true) == 0) ) {
+    if ( ! job_submit_is_nonempty_str(job_desc->reservation) ) {
       info(PLUGIN_SUBTYPE ": reserved partition selected, no reservation provided");
       if ( err_msg ) {
         *err_msg = xstrdup("Jobs in the `reserved` partition require a reservation");
@@ -1176,12 +1247,12 @@ job_submit(
   }
   
   /* Set the job account to match the submission group: */
-  if ( ! __is_nonempty_str(job_desc->account) ) {
+  if ( ! job_submit_is_nonempty_str(job_desc->account) ) {
     gid_t                 submit_gid = job_desc->group_id;
     
     if ( submit_gid >= udhpc_base_gid ) {
       /* Resolve gid to name: */
-      char                *submit_gname = job_submit_udhpc_getgrgid(submit_gid);
+      char                *submit_gname = job_submit_getgrgid(submit_gid);
       
       if ( submit_gname ) {
         if ( job_desc->account != NULL ) xfree(job_desc->account);
@@ -1209,7 +1280,7 @@ job_submit(
   /* Check if any owned-resource partition was chosen; if so, then we need to set
    * the QOS = account if it wasn't set by the user:
    */
-  if ( __has_owned_resource_partition(job_desc->partition) && ! __is_nonempty_str(job_desc->qos) ) {
+  if ( job_submit_has_owned_resource_partition(job_desc->partition) && ! job_submit_is_nonempty_str(job_desc->qos) && job_submit_is_nonempty_str(job_desc->account) ) {
     job_desc->qos = xstrdup(job_desc->account);
     info(PLUGIN_SUBTYPE ": setting job qos to %s", job_desc->qos);
   }
@@ -1218,23 +1289,43 @@ job_submit(
 
 #ifndef DISABLE_WORKGROUP_PARTITIONS
 
-  /* Check the environment for GECOMPAT_SET_WORKGROUP_PARTITION, which our SPANK
-   * plugin would have set if the --workgroup option was provided at job
-   * submission:
-   */
-  if ( (s = getenv("GECOMPAT_SET_WORKGROUP_PARTITION")) && (*s) && (strcmp(s, "0") != 0) ) {
-    if ( (job_desc->partition == NULL) && (job_desc->account != NULL) ) {
-      job_desc->partition = xstrdup(job_desc->account);
-    info(PLUGIN_SUBTYPE ": setting job partition to %s", job_desc->partition);
+  /* If the partition name is __workgroup__ then substitute the job account: */
+  if ( job_submit_is_nonempty_str(job_desc->partition) && job_submit_str_in_list(job_desc->partition, "_workgroup_", true) ) {
+    /* Resolve gid to name: */
+    char                *submit_gname = job_submit_getgrgid(job_desc->group_id);
+    
+    if ( submit_gname ) {
+      char              *new_partition = job_submit_replace_str_in_list(job_desc->partition, "_workgroup_", submit_gname, true);
+      
+      xfree(submit_gname);
+      if ( new_partition ) {
+        xfree(job_desc->partition);
+        job_desc->partition = new_partition;
+        info(PLUGIN_SUBTYPE ": overwriting _workgroup_ partition with %s", new_partition);
+      } else {
+        /* If we can't replace _workgroup_, the job will fail: */
+        if ( err_msg ) {
+          *err_msg = xstrdup_printf("Unable to replace _workgroup_ with %s in partition list", submit_gname);
+        }
+        return SLURM_ERROR;
+      }
+    } else {
+      /* If we can't replace _workgroup_, the job will fail: */
+      if ( err_msg ) {
+        *err_msg = xstrdup_printf("Unable to map submitting workgroup gid %u to its name", (unsigned int)job_desc->group_id);
+      }
+      return SLURM_ERROR;
     }
   }
 
 #endif
 
+#ifndef DISABLE_GPU_GRES_ADJUSTMENTS
+
   /* If GPUs are requested GRES on this job, then ensure that CPU binding is
    * enforced:
    */
-  if ( (job_desc->gres != NULL) && (*(job_desc->gres) != '\0') ) {
+  if ( job_submit_is_nonempty_str(job_desc->gres) ) {
     char        *gpu = job_desc->gres;
     int         gpu_count = 0;
     
@@ -1286,7 +1377,7 @@ job_submit(
         gpu_count += 1;
       }
     }
-    if ( gpu_count > 0 && (job_desc->partition == NULL) || (*(job_desc->partition) == '\0') || (xstrcasestr(job_desc->partition, "gpu-") != NULL)  ) {
+    if ( gpu_count > 0 ) {
       job_desc->bitflags |= GRES_ENFORCE_BIND;
       info(PLUGIN_SUBTYPE ": GPU GRES requested, enabling enforce-bind");
       
@@ -1294,7 +1385,9 @@ job_submit(
       info(PLUGIN_SUBTYPE ": total of %d GPUs requested, setting sockets-per-node accordingly", gpu_count);
     }
   }
-  
+
+#endif
+
   /* Ensure that an empty time-min is set to time-limit: */
   if ( job_desc->time_min == NO_VAL ) {
     job_desc->time_min = job_desc->time_limit;
