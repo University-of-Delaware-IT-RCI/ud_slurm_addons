@@ -26,6 +26,8 @@
 #include <limits.h>
 #include <string.h>
 #include <ctype.h>
+#include <grp.h>
+#include <unistd.h>
 
 #include <slurm/spank.h>
 #include <slurm/slurm.h>
@@ -42,12 +44,12 @@ SPANK_PLUGIN(gridengine_compat, 1)
 static int should_add_sge_env = 0;
 
 /*
- * @function _opt_add_sge_env
+ * @function gecompat_opt_add_sge_env
  *
  * Parse the --add-sge-env option.
  *
  */
-static int _opt_add_sge_env(
+static int gecompat_opt_add_sge_env(
   int         val,
   const char  *optarg,
   int         remote
@@ -59,13 +61,59 @@ static int _opt_add_sge_env(
 }
 
 /*
+ * @function gecompat_getgrgid
+ *
+ * Map a numeric gid_t to its string form.
+ *
+ */
+char*
+gecompat_getgrgid(
+  gid_t           the_gid
+)
+{
+  struct group    *group_info = getgrgid(the_gid);
+  
+  return ( group_info ) ? group_info->gr_name : NULL;
+}
+
+/*
+ * @function gecompat_opt_add_workgroup_partition
+ *
+ * Parse the --workgroup option.
+ *
+ */
+static int gecompat_opt_add_workgroup_partition(
+  int         val,
+  const char  *optarg,
+  int         remote
+)
+{
+  setenv("GECOMPAT_SET_WORKGROUP_PARTITION", "1", 1);
+  slurm_verbose("gridengine_compat:  set GECOMPAT_WORKGROUP_FLAG in environment");
+  return ESPANK_SUCCESS;
+}
+
+/*
  * Options available to this spank plugin:
  */
-struct spank_option spank_options[] =
+struct spank_option spank_options_allocator[] =
 {
     { "add-sge-env", NULL,
       "Add GridEngine equivalents of SLURM job environment variables.",
-      0, 0, (spank_opt_cb_f) _opt_add_sge_env },
+      0, 0, (spank_opt_cb_f) gecompat_opt_add_sge_env },
+    
+    { "workgroup", NULL,
+      "Submit the job to the workgroup partition associate with the account on the job.",
+      0, 0, (spank_opt_cb_f) gecompat_opt_add_workgroup_partition },
+      
+    SPANK_OPTIONS_TABLE_END
+};
+
+struct spank_option spank_options_local[] =
+{
+    { "add-sge-env", NULL,
+      "Add GridEngine equivalents of SLURM job environment variables.",
+      0, 0, (spank_opt_cb_f) gecompat_opt_add_sge_env },
       
     SPANK_OPTIONS_TABLE_END
 };
@@ -87,11 +135,25 @@ slurm_spank_init(
 {
   int                     rc = ESPANK_SUCCESS;
   int                     i;
+  struct spank_option     *opts_to_register = NULL;
   
-  if ( spank_context() == S_CTX_ALLOCATOR ) {
-    struct spank_option   *o = spank_options;
-    
-    while ( o->name && (rc == ESPANK_SUCCESS) ) rc = spank_option_register(spank_ctxt, o++);
+  /*
+   * Get any options registered for this context:
+   */
+  switch ( spank_context() ) {
+    /* salloc, sbatch */
+    case S_CTX_ALLOCATOR: {
+      opts_to_register = spank_options_allocator;
+      break;
+    }
+    /* srun */
+    case S_CTX_LOCAL: {
+      opts_to_register = spank_options_local;
+      break;
+    }
+  }
+  if ( opts_to_register ) {
+    while ( opts_to_register->name && (rc == ESPANK_SUCCESS) ) rc = spank_option_register(spank_ctxt, opts_to_register++);
   }
   
   for ( i = 0; i < argc; i++ ) {

@@ -1136,6 +1136,8 @@ job_submit(
   char                    **err_msg
 )
 {
+  char                    *s;
+  
   /* First and foremost, let's look through the job script
    * (if present) and for SGE compatibility check for
    * directives:
@@ -1149,7 +1151,9 @@ job_submit(
       }
     }
   }
-  
+
+#ifndef DISABLE_RESERVED_PARTITION
+
   /* If submitted against the "reserved" partition, then a reservation
    * must be provided, too:
    */
@@ -1162,6 +1166,8 @@ job_submit(
       return SLURM_ERROR;
     }
   }
+
+#endif
 
   /* Memory limit _must_ be set: */
   if ( (job_desc->pn_min_memory <= 0) || (job_desc->pn_min_memory == NO_VAL64) ) {
@@ -1197,6 +1203,8 @@ job_submit(
       return SLURM_ERROR;
     }
   }
+
+#ifndef DISABLE_HARDWARE_SPECIFIC_PARTITIONS
   
   /* Check if any owned-resource partition was chosen; if so, then we need to set
    * the QOS = account if it wasn't set by the user:
@@ -1205,8 +1213,27 @@ job_submit(
     job_desc->qos = xstrdup(job_desc->account);
     info(PLUGIN_SUBTYPE ": setting job qos to %s", job_desc->qos);
   }
-  
-  /* If GRES are requested, then ensure that CPU binding is enforced: */
+
+#endif
+
+#ifndef DISABLE_WORKGROUP_PARTITIONS
+
+  /* Check the environment for GECOMPAT_SET_WORKGROUP_PARTITION, which our SPANK
+   * plugin would have set if the --workgroup option was provided at job
+   * submission:
+   */
+  if ( (s = getenv("GECOMPAT_SET_WORKGROUP_PARTITION")) && (*s) && (strcmp(s, "0") != 0) ) {
+    if ( (job_desc->partition == NULL) && (job_desc->account != NULL) ) {
+      job_desc->partition = xstrdup(job_desc->account);
+    info(PLUGIN_SUBTYPE ": setting job partition to %s", job_desc->partition);
+    }
+  }
+
+#endif
+
+  /* If GPUs are requested GRES on this job, then ensure that CPU binding is
+   * enforced:
+   */
   if ( (job_desc->gres != NULL) && (*(job_desc->gres) != '\0') ) {
     char        *gpu = job_desc->gres;
     int         gpu_count = 0;
@@ -1265,11 +1292,6 @@ job_submit(
       
       job_desc->sockets_per_node = gpu_count;
       info(PLUGIN_SUBTYPE ": total of %d GPUs requested, setting sockets-per-node accordingly", gpu_count);
-      
-      if ( (job_desc->partition == NULL) || (*(job_desc->partition) == '\0') ) {
-        job_desc->partition = xstrdup("gpu-128GB");
-        info(PLUGIN_SUBTYPE ": GRES requested, no partition indicated so defaulting to gpu-128GB");
-      }
     }
   }
   
