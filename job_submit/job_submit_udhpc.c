@@ -1256,7 +1256,7 @@ job_submit(
       
       if ( submit_gname ) {
         if ( job_desc->account != NULL ) xfree(job_desc->account);
-        job_desc->account = submit_gname;
+        job_desc->account = xstrdup(submit_gname);
         info(PLUGIN_SUBTYPE ": setting job account to %s (%u)", submit_gname, submit_gid);
       } else {
         info(PLUGIN_SUBTYPE ": unable to resolve job submission gid %u; job account not set", submit_gid);
@@ -1297,7 +1297,6 @@ job_submit(
     if ( submit_gname ) {
       char              *new_partition = job_submit_replace_str_in_list(job_desc->partition, "_workgroup_", submit_gname, true);
       
-      xfree(submit_gname);
       if ( new_partition ) {
         xfree(job_desc->partition);
         job_desc->partition = new_partition;
