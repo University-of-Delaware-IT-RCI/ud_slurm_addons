@@ -1228,7 +1228,7 @@ job_submit(
   /* If submitted against the "reserved" partition, then a reservation
    * must be provided, too:
    */
-  if ( job_submit_is_nonempty_str(job_desc->partition) && (job_submit_str_in_list(job_desc->partition, "reserved", true) == 0) ) {
+  if ( job_submit_is_nonempty_str(job_desc->partition) && job_submit_str_in_list(job_desc->partition, "reserved", true) ) {
     if ( ! job_submit_is_nonempty_str(job_desc->reservation) ) {
       info(PLUGIN_SUBTYPE ": reserved partition selected, no reservation provided");
       if ( err_msg ) {
