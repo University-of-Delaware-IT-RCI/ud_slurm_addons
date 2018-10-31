@@ -150,6 +150,8 @@ for partition_name in partition_names:
 	allowQos = partitions[partition_name]['AllowQos'].split(',')
 	if target_account in allowQos:
 		accessGranted = True
+	elif partitions[partition_name]['QoS'] == target_account:
+		accessGranted = True
 	elif 'normal' in allowQos:
 		#
 		# Check for account-based access:
