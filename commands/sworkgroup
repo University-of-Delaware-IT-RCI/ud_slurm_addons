@@ -187,7 +187,7 @@ for partition_name in partition_names:
 			#
 			# Are there workgroup QOS limits on this partition?
 			#
-			if target_account in allowQos:
+			if target_account in allowQos or partitions[partition_name]['QoS'] == target_account:
 				qos = get_qos_definition(target_account)
 				if qos['GrpTRES']:
 					line[3] += (', ' if line[3] else '') + human_readable_tres(qos['GrpTRES'])
