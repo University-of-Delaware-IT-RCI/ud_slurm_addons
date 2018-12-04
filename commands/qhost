@@ -95,7 +95,6 @@ class Hostlist(object):
 		# 1) prefix string (may be empty)
 		# 2) rangelist in brackets (may be missing)
 		# 3) the rest
-		print s
 		m = re.match(r'([^,\[]*)(\[[^\]]*\])?(.*)', s)
 		(prefix, rangelist, rest) = m.group(1,2,3)
 
@@ -584,16 +583,14 @@ if node_list:
 				# yield at most number-of-fields components):
 				components = line.split('|', len(squeue_fields) - 1)
 				if len(components) == len(squeue_fields):
-					#try:
+					try:
 						job_info = JobInfo(dict(zip(squeue_fields, components)))
 						# Grab per-node records:
 						for per_node_job_info in job_info.per_host_records():
 							if per_node_job_info.hosts[0] in node_list:
 								node_list[per_node_job_info.hosts[0]].add_job(per_node_job_info)
-							else:
-								sys.stderr.write('WARNING:  invalid line:  ' + line + '\n')
-					#except Exception as E:
-					#	sys.stderr.write('WARNING:  failed parsing job info for {}: {}\n'.format(components[3], str(E)))
+					except Exception as E:
+						sys.stderr.write('WARNING:  failed parsing job info for {}: {}\n'.format(components[3], str(E)))
 				else:
 					sys.stderr.write('WARNING:  invalid job info line:  ' + line + '\n')
 
