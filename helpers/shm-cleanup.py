@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 #
 # As time goes by and jobs are killed or cancelled, files get orphaned in
 # /dev/shm and tie-up valuable memory.  This script builds a list of first-level
