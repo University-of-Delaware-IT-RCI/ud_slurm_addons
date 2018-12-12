@@ -1,0 +1,590 @@
+#!/usr/bin/env python
+#
+# qstatgrp
+#
+# Implementation of the Grid Engine "qstatgrp" command (which actually just
+# calls-through to "qstat") atop the Slurm "sinfo," "squeue," and "scontrol"
+# commands.
+#
+
+import sys
+import os
+import grp
+import subprocess
+import re
+import argparse
+
+def str_trunc(s, max_len = -1):
+	"""Truncate a string to a maximum length.
+
+	If max_len is negative or zero, then the full string is returned.
+
+	Otherwise, if the length of s exceeds max_len then s is truncated to (max_len - 1) characters with a plus sign (+) suffix.  Note that if max_len is 1 then the plus sign is omitted and just the first character of s is returned.
+	"""
+	if max_len > 0:
+		if len(s) > max_len:
+			if max_len > 1:
+				return s[0:max_len - 1] + '+'
+			return s[0:max_len]
+	return s
+
+#
+# Borrowed from TACC "pylauncher" code:
+#
+class Hostlist(object):
+	"""Expand a hostlist expression string to a Python list.
+
+	  Example:
+
+	      expand_hostlist("n[9-11],d[01-02]") ==> ['n9', 'n10', 'n11', 'd01', 'd02']
+
+	Unless allow_duplicates is true, duplicates will be purged from the results.
+
+	If sort is true, the output will be sorted.
+	"""
+
+	max_list_length = 10000
+
+	def __init__(self, hostlist, allow_duplicates=False, sort=False):
+		self.hostlist = []
+		bracket_level = 0
+		part = ""
+
+		for c in hostlist + ",":
+			if c == "," and bracket_level == 0:
+				# Comma at top level, split!
+				if part: self.hostlist.extend(Hostlist.expand_part(part))
+				part = ""
+				bad_part = False
+			else:
+				part += c
+
+			if c == "[":
+				bracket_level += 1
+			elif c == "]":
+				bracket_level -= 1
+
+			if bracket_level > 1:
+				raise BadHostlist, "nested brackets"
+			elif bracket_level < 0:
+				raise BadHostlist, "unbalanced brackets"
+
+		if bracket_level > 0:
+			raise BadHostlist, "unbalanced brackets"
+
+		if not allow_duplicates:
+			self.hostlist = Hostlist.remove_duplicates(self.hostlist)
+		if sort:
+			self.hostlist = Hostlist.numerically_sorted(self.hostlist)
+
+	def __len__(self):
+		return len(self.hostlist)
+
+	def __getitem__(self, key):
+		return self.hostlist.__getitem__(key)
+
+	def __iter__(self):
+		return self.hostlist.__iter__()
+
+	@staticmethod
+	def expand_part(s):
+		"""Expand a part (e.g. "x[1-2]y[1-3][1-3]") (no outer level commas)."""
+
+		# Base case: the empty part expand to the singleton list of ""
+		if s == "":
+			return [""]
+
+		# Split into:
+		# 1) prefix string (may be empty)
+		# 2) rangelist in brackets (may be missing)
+		# 3) the rest
+		m = re.match(r'([^,\[]*)(\[[^\]]*\])?(.*)', s)
+		(prefix, rangelist, rest) = m.group(1,2,3)
+
+		# Expand the rest first (here is where we recurse!)
+		rest_expanded = Hostlist.expand_part(rest)
+
+		# Expand our own part
+		if not rangelist:
+			# If there is no rangelist, our own contribution is the prefix only
+			us_expanded = [prefix]
+		else:
+			# Otherwise expand the rangelist (adding the prefix before)
+			us_expanded = Hostlist.expand_rangelist(prefix, rangelist[1:-1])
+
+		# Combine our list with the list from the expansion of the rest
+		# (but guard against too large results first)
+		if len(us_expanded) * len(rest_expanded) > Hostlist.max_list_length:
+			raise BadHostlist, "results too large"
+
+		return [us_part + rest_part
+			for us_part in us_expanded
+			for rest_part in rest_expanded]
+
+	@staticmethod
+	def expand_rangelist(prefix, rangelist):
+		""" Expand a rangelist (e.g. "1-10,14"), putting a prefix before."""
+
+		# Split at commas and expand each range separately
+		results = []
+		for range_ in rangelist.split(","):
+			results.extend(Hostlist.expand_range(prefix, range_))
+		return results
+
+	@staticmethod
+	def expand_range(prefix, range_):
+		""" Expand a range (e.g. 1-10 or 14), putting a prefix before."""
+
+		# Check for a single number first
+		m = re.match(r'^[0-9]+$', range_)
+		if m:
+			return ["%s%s" % (prefix, range_)]
+
+		# Otherwise split low-high
+		m = re.match(r'^([0-9]+)-([0-9]+)$', range_)
+		if not m:
+			raise BadHostlist, "bad range"
+
+		(s_low, s_high) = m.group(1,2)
+		low = int(s_low)
+		high = int(s_high)
+		width = len(s_low)
+
+		if high < low:
+			raise BadHostlist, "start > stop"
+		elif high - low > Hostlist.max_list_length:
+			raise BadHostlist, "range too large"
+
+		results = []
+		for i in xrange(low, high+1):
+			results.append("%s%0*d" % (prefix, width, i))
+		return results
+
+	@staticmethod
+	def remove_duplicates(l):
+		"""Remove duplicates from a list (but keep the order)."""
+		results = []
+		for e in l:
+			if e not in results:
+				results.append(e)
+		return results
+
+	@staticmethod
+	def numerically_sorted(l):
+		"""Sort a list of hosts numerically.
+		E.g. sorted order should be n1, n2, n10; not n1, n10, n2.
+		"""
+		return sorted(l, key=Hostlist.numeric_sort_key)
+
+	nsk_re = re.compile("([0-9]+)|([^0-9]+)")
+	@staticmethod
+	def numeric_sort_key(x):
+		return [Hostlist.handle_int_nonint(i_ni) for i_ni in Hostlist.nsk_re.findall(x)]
+
+	@staticmethod
+	def handle_int_nonint(int_nonint_tuple):
+		if int_nonint_tuple[0]:
+			return int(int_nonint_tuple[0])
+		else:
+			return int_nonint_tuple[1]
+
+
+#
+# The field names passed to squeue with the --Format flag when fetching
+# job info:
+#
+squeue_fields = (	'batchhost',
+			'batchflag',
+			'nodelist',
+			'arrayjobid',
+			'arraytaskid',
+			'prioritylong',
+			'username',
+			'statecompact',
+			'starttime',
+			'partition',
+			'cpuspertask',
+			'minmemory',
+			'numtasks',
+			'numnodes',
+			'numcpus',
+			'sockets',
+			'cores',
+			'threads',
+			'ntpercore',
+			'ntpernode',
+			'ntpersocket',
+			'gres',
+			'account',
+			'name'
+		)
+
+class JobInfo(object):
+	"""Instances of the JobInfo class represent Slurm job information.
+
+	An instance is primarily composed of instance variables:
+
+		job_id			Slurm job id
+		task_id			Task id within job
+		master_host		For batch jobs, the host on which the batch script executes
+		is_batch		True if the job is a batch job
+		hosts			List of hosts on which the job executes
+		prioritylong		Integer scheduling priority of the job
+		job_name		Name of the job
+		user_name		Username of the job owner
+		state			State of the job in compact form (e.g. "R")
+		start_time		Date and time when the job began executing
+		account			Workgroup (account) for the job
+		partition		Partition in which the job is running
+		minmemory		Minimum amount of memory available to job
+		ncpus_per_task		Number of CPUs per task
+		ntasks			Number of tasks in job
+		nnodes			Number of nodes allocated to the job
+		ncpus			Number of CPUs allocated to the job
+		nsockets		Requested per-node socket count
+		ncores			Requested per-node core count
+		nthreads		Requested per-node thread count
+		ntasks_per_core		Requested number of tasks per allocated core
+		ntasks_per_node		Requested number of tasks per allocated node
+		ntasks_per_socket	Requested number of tasks per allocated socket
+		gres			Generic resources requested for job
+
+	"""
+
+	def __init__(self, spec = None):
+		"""Initialize a newly-allocated JobInfo object using a dictionary of key-value pairs representing the properties of the job.  The keys can be found in the squeue_fields variable above; they correspond to --Format fields accepted by the squeue command.
+
+		If spec is not a dictionary but instead a JobInfo instance, then the new instance is initialized with the same values contained in the spec JobInfo object.
+
+		Most of the count arguments default to zero if unspecified by the job.
+		"""
+		if isinstance(spec, JobInfo):
+			self.__dict__.update(spec.__dict__)
+		elif isinstance(spec, dict):
+			self.job_id = spec['arrayjobid']
+			self.task_id = '' if (spec['arraytaskid'] == 'N/A') else spec['arraytaskid']
+
+			self.master_host = spec['batchhost']
+			try:
+				self.is_batch = False if (int(spec['batchflag']) == 0) else True
+			except:
+				self.is_batch = False
+
+			self.hosts = Hostlist(spec['nodelist'])
+			self._per_host_records = None
+			self._scontrol_job_info = None
+
+			try:
+				self.priority = int(spec['prioritylong'])
+			except:
+				self.priority = 0
+
+			self.job_name = spec['name']
+			self.user_name = spec['username']
+			self.state = spec['statecompact']
+			self.start_time = spec['starttime']
+			self.partition = spec['partition']
+			self.account = spec['account']
+			self.minmemory = spec['minmemory']
+			self.gres = spec['gres'] if spec['gres'] != '(null)' else ''
+			try:
+				self.ncpus_per_task = int(spec['cpuspertask'])
+			except:
+				self.ncpus_per_task = 0
+			try:
+				self.ntasks = int(spec['numtasks'])
+			except:
+				self.ntasks = 0
+			try:
+				self.nnodes = int(spec['numnodes'])
+			except:
+				self.nnodes = 0
+			try:
+				self.ncpus = int(spec['numcpus'])
+			except:
+				self.ncpus = 0
+			try:
+				self.nsockets = int(spec['sockets'])
+			except:
+				self.nsockets = 0
+			try:
+				self.ncores = int(spec['cores'])
+			except:
+				self.ncores = 0
+			try:
+				self.nthreads = int(spec['threads'])
+			except:
+				self.nthreads = 0
+			try:
+				self.ntasks_per_core = int(spec['ntpercore'])
+			except:
+				self.ntasks_per_core = 0
+			try:
+				self.ntasks_per_node = int(spec['ntpernode'])
+			except:
+				self.ntasks_per_node = 0
+			try:
+				self.ntasks_per_socket = int(spec['ntpersocket'])
+			except:
+				self.ntasks_per_socket = 0
+		else:
+			self.job_id = ''
+			self.task_id = ''
+			self.master_host = ''
+			self.is_batch = False
+			self.hosts = []
+			self._per_host_records = None
+			self._scontrol_job_info = None
+			self.priority = 0
+			self.job_name = ''
+			self.user_name = ''
+			self.state = ''
+			self.start_time = ''
+			self.partition = ''
+			self.account = ''
+			self.minmemory = ''
+			self.gres = ''
+			self.ncpus_per_task = 0
+			self.ntasks = 0
+			self.nnodes = 0
+			self.ncpus = 0
+			self.nsockets = 0
+			self.ncores = 0
+			self.nthreads = 0
+			self.ntasks_per_core = 0
+			self.ntasks_per_node = 0
+			self.ntasks_per_socket = 0
+	
+	def aggregate(self, other_job):
+		"""When aggregating, we add all numerical fields into ourself and any string-based fields are ignored."""
+		self.nnodes += other_job.nnodes
+		self.ntasks += other_job.ntasks
+		self.ncpus += other_job.ncpus
+		self.nsockets += other_job.nsockets
+		self.ncores += other_job.ncores
+
+	def task_to_node_mapping(self):
+		"""Load per-node CPU counts for this job using the scontrol utility.  If successful, returns a dictionary mapping node names to CPU counts."""
+		if not self._scontrol_job_info:
+			try:
+				output = subprocess.check_output(['/opt/shared/slurm/bin/scontrol', 'show', 'job', self.job_id, '-dd'])
+				output = output.strip()
+				self._scontrol_job_info = {}
+				for line in output.split('\n'):
+					m = re.match(r'\s*Nodes=(\S+)\s+CPU_IDs=(\S+)',line)
+					if m:
+						hosts = Hostlist(m.group(1))
+						ncpus = len(Hostlist.expand_rangelist('', m.group(2)))
+						for host in hosts:
+							self._scontrol_job_info[host] = ncpus
+
+			except:
+				pass
+		return self._scontrol_job_info
+
+	def per_host_copy(self, nodeaddr):
+		"""Create a copy of this JobInfo instance which inherits the original's attributes but has a single nodeaddr in its hosts list."""
+		copy = JobInfo(self)
+		copy.hosts = Hostlist(nodeaddr)
+		return copy
+
+	def per_host_records(self):
+		"""Return a list of JobInfo objects that represent each participating-host's complement of CPUs."""
+		if len(self.hosts) == 1:
+			return [self]
+
+		if not self._per_host_records:
+			self._per_host_records = []
+			if self.ntasks_per_node > 0:
+				# Each node will have this many tasks, so we don't need additional info:
+				for nodeaddr in self.hosts:
+					per_node = self.per_host_copy(nodeaddr)
+					per_node.ntasks = self.ntasks_per_node
+					self._per_host_records.append(per_node)
+			else:
+				# Use scontrol to get tasks-to-node mappings:
+				task_map = self.task_to_node_mapping()
+				for nodeaddr in self.hosts:
+					per_node = self.per_host_copy(nodeaddr)
+					per_node.ntasks = per_node.ncpus = task_map[nodeaddr]
+					self._per_host_records.append(per_node)
+		return self._per_host_records
+
+
+class WorkgroupLimits(object):
+	"""Instances of this class wrap a list of trackable resource limits (as from a QOS GrpTRES)."""
+
+	def __init__(self, spec = None):
+		if isinstance(spec, WorkgroupLimits):
+			self.tres = spec.tres
+			self.gres = spec.gres
+		else:
+			self.tres = dict()
+			self.gres = dict()
+			if spec:
+				for telem in spec.split(','):
+					telem = telem.split('=', 1)
+					if telem[0].startswith('gres/'):
+						self.gres[telem[0][5:]] = int(telem[1])
+					else:
+						self.tres[telem[0]] = int(telem[1])
+	
+	def __repr__(self):
+		return 'TRES: ' + str(self.tres) + '; GRES: ' + str(self.gres)
+						
+	def gres_str(self):
+		return ','.join( [k + '=' + str(v) for k, v in self.gres.iteritems()])
+
+#
+# Process command-line arguments:
+#
+arg_parser = argparse.ArgumentParser(
+			description = 'Display per-workgroup job information akin to Grid Engine qstatgrp')
+
+arg_parser.add_argument('-g', '--group', action = 'append', dest = 'grouplist', metavar = '<gid>', help = 'restrict to jobs running under the given workgroup (can be specified multiple times)')
+arg_parser.add_argument('-o', '--group-only', action = 'store_true', dest = 'group_only', help = 'display for the workgroup partition only')
+arg_parser.add_argument('-j', '--jobs', action = 'store_true', dest = 'no_summary', help = 'show all jobs, not an aggregate summary of them')
+argv = arg_parser.parse_args()
+
+#
+# If no groups were explicitly provided, use the user's current gid:
+#
+if argv.grouplist is None:
+	try:
+		runas_group = grp.getgrgid(os.getgid())
+		if runas_group.gr_name == 'everyone':
+			sys.exit('ERROR:  your current shell is not running as an HPC workgroup')
+		argv.grouplist = [runas_group.gr_name]
+	except:
+		sys.exit('ERROR:  unable to determine your current workgroup id')
+else:
+	out_grouplist = []
+	for gid in argv.grouplist:
+		try:
+			if re.match(r'^[0-9]+$', gid):
+				check_group = grp.getgrgid(int(gid))
+			else:
+				check_group = grp.getgrnam(gid)
+		except:
+			sys.exit('ERROR:  no such workgroup: ' + gid)
+		out_grouplist.append(check_group.gr_name)
+	argv.grouplist = out_grouplist
+
+#
+# Setup the squeue command that we'll issue:
+#
+squeue_cmd = ['/opt/shared/slurm/bin/squeue', '--noheader', '--parseable', '--account=' + ','.join(argv.grouplist), '--states=R,PD,CF,CG,RQ,RS,NF,ST,S', '--sort=P,t', '--array-unique', '--Format', ','.join(squeue_fields) ]
+if argv.group_only:
+	squeue_cmd.extend(['--partition=' + ','.join(argv.grouplist)])
+try:
+	output = subprocess.check_output(squeue_cmd).strip()
+except subprocess.CalledProcessError as E:
+	sys.stderr.write('ERROR:  failed to execute squeue (rc = {}): {}\n'.format(E.returncode, E.output))
+except Exception as E:
+	sys.stderr.write('ERROR:  failed to execute squeue ({}): {}\n'.format(E.__class__, str(E)))
+
+#
+# Produce the list of jobs:
+#
+joblist = []
+for line in output.strip().split('\n'):
+	line = line.strip()
+	if line:
+		# Since the final field -- job name -- could have whitespace, limit
+		# the number of splits to the number of fields minus one (which would
+		# yield at most number-of-fields components):
+		components = line.split('|', len(squeue_fields) - 1)
+		if len(components) == len(squeue_fields):
+			try:
+				joblist.append(JobInfo(dict(zip(squeue_fields, components))))
+			except Exception as E:
+				sys.stderr.write('WARNING:  failed parsing job info for {}: {}\n'.format(components[3], str(E)))
+
+#
+# If the user is looking for a summary, we want to group by account and partition:
+#
+if len(joblist) > 0:
+	#
+	# Since squeue can't sort by account, we have to sort the result set ourselves:
+	#
+	joblist.sort(key = lambda job: job.account + ':' + job.partition)
+	
+	if argv.no_summary:
+		if len(argv.grouplist) > 1:
+			output_format = '{0:24s}{1:24s}{2:24s}{3:12s}{4:>8d}{5:>6s}{6:>12d}{7:>12d}{8:>12s}{9:>24s}'
+			header_format = '{0:24s}{1:24s}{2:24s}{3:12s}{4:>8s}{5:>6s}{6:>12s}{7:>12s}{8:>12s}{9:>24s}'
+		else:
+			output_format = '{1:24s}{2:24s}{3:12s}{4:>8d}{5:>6s}{6:>12d}{7:>12d}{8:>12s}{9:>24s}'
+			header_format = '{1:24s}{2:24s}{3:12s}{4:>8s}{5:>6s}{6:>12s}{7:>12s}{8:>12s}{9:>24s}'
+		print header_format.format('ACCOUNT', 'PARTITION', 'JOBID', 'OWNER', 'PRIORITY', 'STATE', 'NODES', 'CPUS', 'MEM', 'GRES')
+		print header_format.format('-'*24, '-'*24, '-'*24, '-'*12, '-'*8, '-'*6, '-'*12, '-'*12, '-'*12, '-'*24)
+		for job in joblist:
+			print output_format.format(job.account, job.partition, job.job_id, str_trunc(job.user_name, 12), job.priority, job.state, job.nnodes, job.ncpus, job.minmemory, str_trunc(job.gres, 24))
+	else:
+		aggr_joblist = []
+		summary_standin = None
+		#
+		# Aggregate, grouping by account and partition:
+		for job in joblist:
+			if summary_standin is None or summary_standin.account != job.account or summary_standin.partition != job.partition:
+				if summary_standin:
+					aggr_joblist.append(summary_standin)
+				summary_standin = JobInfo()
+				summary_standin.account = job.account
+				summary_standin.partition = job.partition
+			summary_standin.aggregate(job)
+		if summary_standin:
+			aggr_joblist.append(summary_standin)
+
+		#
+		# Retrieve TRES limits for each group:
+		#
+		sacctmgr_cmd = ['/opt/shared/slurm/bin/sacctmgr', '--noheader', '--parsable2', 'show', 'qos', ','.join(argv.grouplist)]
+		try:
+			output = subprocess.check_output(sacctmgr_cmd).strip()
+		except subprocess.CalledProcessError as E:
+			sys.stderr.write('ERROR:  failed to execute sacctmgr (rc = {}): {}\n'.format(E.returncode, E.output))
+		except Exception as E:
+			sys.stderr.write('ERROR:  failed to execute sacctmgr ({}): {}\n'.format(E.__class__, str(E)))
+		workgroup_limits = dict()
+		for line in output.strip().split('\n'):
+			line = line.strip()
+			if line:
+				components = line.split('|')
+				if components[0]:
+					workgroup_limits[components[0]] = WorkgroupLimits(components[8])
+
+		#
+		# Display the information:
+		#
+		if len(argv.grouplist) > 1:
+			output_format = '{0:24s}{1:24s}{2:>12d}{3:>12d}'
+			header_format = '{0:24s}{1:24s}{2:>12s}{3:>12s}{4:>12s}{5:>12s}'
+		else:
+			output_format = '{1:24s}{2:>12d}{3:>12d}'
+			header_format = '{1:24s}{2:>12s}{3:>12s}{4:>12s}{5:>12s}'
+		ext_output_format = output_format + '{4:>12d}{5:>12d}'
+		print header_format.format('WORKGROUP', 'PARTITION', 'NODES', 'CPUS', 'MAX NODES', 'MAX CPUS')
+		print header_format.format('-'*24, '-'*24, '-'*12, '-'*12, '-'*12, '-'*12)
+		account_aggr = None
+		total_aggr = JobInfo()
+		for partition in aggr_joblist:
+			if account_aggr is None or account_aggr.account != partition.account:
+				if account_aggr:
+					print output_format.format('', '- SUBTOTAL', account_aggr.nnodes, account_aggr.ncpus)
+					print
+				account_aggr = JobInfo()
+				account_aggr.account = partition.account
+			account_aggr.aggregate(partition)
+			total_aggr.aggregate(partition)
+			if partition.account == partition.partition:
+				if partition.account in workgroup_limits:
+					limits = workgroup_limits[partition.account]
+					print ext_output_format.format(partition.account, partition.partition, partition.nnodes, partition.ncpus, limits.tres['node'], limits.tres['cpu'])
+			else:
+				print output_format.format(partition.account, partition.partition, partition.nnodes, partition.ncpus)
+		if len(argv.grouplist) > 1 and account_aggr:
+			print output_format.format('', '- SUBTOTAL', account_aggr.nnodes, account_aggr.ncpus)
+			print
+		print output_format.format('', '- TOTAL', total_aggr.nnodes, total_aggr.ncpus)
+

@@ -36,6 +36,11 @@ const gid_t udhpc_base_gid = UDHPC_BASE_GID;
 const uint64_t udhpc_min_mem_mb = UDHPC_MIN_MEM_MB;
 
 
+#ifndef JOB_SUBMIT_WORKGROUP_TOKEN
+#define JOB_SUBMIT_WORKGORUP_TOKEN "_workgroup_"
+#endif
+const char *udhpc_workgroup_token = JOB_SUBMIT_WORKGORUP_TOKEN;
+
 char*
 job_submit_getgrgid(
   gid_t           the_gid
@@ -87,6 +92,26 @@ job_submit_getgrgid(
     out_gname = cached_gname;
   }
   return out_gname;
+}
+
+
+extern bool
+job_submit_partition_is_workgroup(
+  const char    *partition,
+  size_t        partition_len
+)
+{
+  char          local_partition[partition_len + 1];
+  
+  // Lookup partition as a grp; if the grp exists, then
+  // it's a workgroup partition.
+  //
+  // Since we do NOT need to access the fields of the
+  // group struct, the simple fact that getgrnam() returns
+  // non-NULL is enough for us, making this very simple:
+  strncpy(local_partition, partition, partition_len);
+  local_partition[partition_len] = '\0';
+  return ( (getgrnam(partition) != NULL) ? true : false );
 }
 
 
@@ -584,7 +609,8 @@ job_submit_sge_parser(
   bool                  should_join_stdout_stderr = true;
   bool                  is_set_stderr = ( job_desc->std_err ? true : false );
   bool                  has_cpu_counts = 0;
-                  
+
+#ifdef EMIT_EXTRA_INFO
   info(PLUGIN_SUBTYPE ": cpu constraints before => ntasks = %u, cpus_per_task = %hu, bitflags = %08x, cpus = %u-%u, nodes = %u-%u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u",
       job_desc->num_tasks,
       job_desc->cpus_per_task,
@@ -604,6 +630,8 @@ job_submit_sge_parser(
       job_desc->ntasks_per_board,
       job_desc->pn_min_cpus
     );
+#endif
+
   int     i = 0;
   while ( i < job_desc->env_size ) {
     if ( (strncmp(job_desc->environment[i], "SLURM_NTASKS=", 13) == 0) ||
@@ -1170,8 +1198,8 @@ next_number:    v = strtol(s, &e, 10);
     }
     info(PLUGIN_SUBTYPE ": stderr set to path \"%s\"", job_desc->std_err);
   }
-  
-                  
+
+#ifdef EMIT_EXTRA_INFO
   info(PLUGIN_SUBTYPE ": cpu constraints after => ntasks = %u, cpus_per_task = %hu, bitflags = %08x, cpus = %u-%u, nodes = %u-%u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u",
       job_desc->num_tasks,
       job_desc->cpus_per_task,
@@ -1191,7 +1219,7 @@ next_number:    v = strtol(s, &e, 10);
       job_desc->ntasks_per_board,
       job_desc->pn_min_cpus
     );
-  
+#endif
   return SLURM_SUCCESS;
 }
 
@@ -1287,15 +1315,49 @@ job_submit(
 
 #endif
 
+#ifndef DISABLE_PRIORITY_ACCESS_QOS
+
+  /* Check if this job is headed for a workgroup partition; if it is and there
+   * is no explicit QOS, then set the "priority-access" QOS on the job:
+   */
+  if ( job_submit_is_nonempty_str(job_desc->partition) && ! job_submit_is_nonempty_str(job_desc->qos) ) {
+    const char        *partition_list = job_desc->partition;
+    bool              workgroup_only = true;
+    
+    while ( *partition_list ) {
+      const char      *comma = partition_list;
+      size_t          partition_len;
+      
+      while ( *comma && (*comma != ',') ) comma++;
+      partition_len = comma - partition_list;
+      if ( partition_len > 0 ) {
+        /* Workgroup? */
+        if ( (strncmp(partition_list, udhpc_workgroup_token, partition_len) != 0) && ! job_submit_partition_is_workgroup(partition_list, partition_len) ) {
+          workgroup_only = false;
+          break;
+        }
+      } else {
+        break;
+      }
+      partition_list += partition_len;
+      while ( *partition_list == ',' ) partition_list++;
+    }
+    if ( workgroup_only ) {
+      job_desc->qos = xstrdup("priority-access");
+    }
+  }
+
+#endif
+
 #ifndef DISABLE_WORKGROUP_PARTITIONS
 
-  /* If the partition name is __workgroup__ then substitute the job account: */
-  if ( job_submit_is_nonempty_str(job_desc->partition) && job_submit_str_in_list(job_desc->partition, "_workgroup_", true) ) {
+  /* If the partition name is _workgroup_ then substitute the job account: */
+  if ( job_submit_is_nonempty_str(job_desc->partition) && job_submit_str_in_list(job_desc->partition, udhpc_workgroup_token, true) ) {
     /* Resolve gid to name: */
     char                *submit_gname = job_submit_getgrgid(job_desc->group_id);
     
     if ( submit_gname ) {
-      char              *new_partition = job_submit_replace_str_in_list(job_desc->partition, "_workgroup_", submit_gname, true);
+      char              *new_partition = job_submit_replace_str_in_list(job_desc->partition, udhpc_workgroup_token, submit_gname, true);
       
       if ( new_partition ) {
         xfree(job_desc->partition);

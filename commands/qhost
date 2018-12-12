@@ -572,7 +572,7 @@ if node_list:
 		try:
 			output = subprocess.check_output(squeue_cmd).strip()
 		except subprocess.CalledProcessError as E:
-			sys.stderr.write('ERROR:  failed to execute squeue (rc = {}): {}\n'.format(E.returncode, E.outout))
+			sys.stderr.write('ERROR:  failed to execute squeue (rc = {}): {}\n'.format(E.returncode, E.output))
 		except Exception as E:
 			sys.stderr.write('ERROR:  failed to execute squeue ({}): {}\n'.format(E.__class__, str(E)))
 		for line in output.strip().split('\n'):
