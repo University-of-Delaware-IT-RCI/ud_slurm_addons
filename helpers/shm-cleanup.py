@@ -156,6 +156,10 @@ cli_parser.add_argument('--daemon-period',
 		metavar='<period>', default='86400', dest='daemon_period',
 		help='wake to re-check on the given period; integer or floating-point values are acceptable with optional unit of s/m/h/d (default: s)'
 	)
+cli_parser.add_argument('--pid-file',
+		metavar='<filename>', default='/var/run/shm-cleanup.pid', dest='pid_file',
+		help='in daemon mode, write our pid to this file (default: /var/run/shm-cleanup.pid)'
+	)
 
 
 cli_args = cli_parser.parse_args()
@@ -350,17 +354,58 @@ if cli_args.is_daemon:
 	logging.info('daemonizing on a period of %d second(s)', daemon_period)
 
 	#
-	# We want to ignore SIGHUP instead of being killed:
+	# Get pid file setup:
+	#
+	pid_file = None
+	if cli_args.pid_file:
+		if not cli_args.pid_file.startswith('/'):
+			logging.critical('pid file not an absolute path: %s', cli_args.pid_file)
+			sys.exit(2)
+		# File exists?
+		if os.path.exists(cli_args.pid_file):
+			logging.critical('pid file already exists: %s', cli_args.pid_file)
+			sys.exit(2)
+		# Open file for write:
+		try:
+			pid_fptr = open(cli_args.pid_file, 'w')
+			pid_fptr.write(str(os.getpid()))
+			pid_fptr.close()
+		except Exception as E:
+			logging.critical('could not write to pid file %s: %s', cli_args.pidfile, str(E))
+		pid_file = cli_args.pid_file
+		logging.info('pid written to %s', pid_file)
+
+	#
+	# We want to ignore SIGHUP instead of being killed and remove
+	# our pid file on termination:
 	#
 	import signal
 	signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
+	def termination_handler(signum, frame):
+		if pid_file is not None and os.path.exists(pid_file):
+			try:
+				os.remove(pid_file)
+			except Exception as E:
+				logging.critical('could not remove pid file %s: %s', pid_file, str(E))
+		sys.exit(0)
+	signal.signal(signal.SIGTERM, termination_handler)
+	signal.signal(signal.SIGINT, termination_handler)
+
 	#
 	# Enter our runloop; only being killed will break us out:
 	#
-	while True:
-		do_scan()
-		time.sleep(daemon_period)
+	try:
+		while True:
+			do_scan()
+			time.sleep(daemon_period)
+	except:
+		pass
+	if pid_file is not None and os.path.exists(pid_file):
+		try:
+			os.remove(pid_file)
+		except Exception as E:
+			logging.critical('could not remove pid file %s: %s', pid_file, str(E))
 else:
 	#
 	# Single run only:
