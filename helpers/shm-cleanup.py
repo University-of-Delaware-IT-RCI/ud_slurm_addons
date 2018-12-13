@@ -386,8 +386,10 @@ if cli_args.is_daemon:
 		if pid_file is not None and os.path.exists(pid_file):
 			try:
 				os.remove(pid_file)
+				logging.info('removed pid file %s', pid_file)
 			except Exception as E:
 				logging.critical('could not remove pid file %s: %s', pid_file, str(E))
+		logging.info('exiting on signal %d', signum)
 		sys.exit(0)
 	signal.signal(signal.SIGTERM, termination_handler)
 	signal.signal(signal.SIGINT, termination_handler)
@@ -404,6 +406,7 @@ if cli_args.is_daemon:
 	if pid_file is not None and os.path.exists(pid_file):
 		try:
 			os.remove(pid_file)
+			logging.info('removed pid file %s', pid_file)
 		except Exception as E:
 			logging.critical('could not remove pid file %s: %s', pid_file, str(E))
 else:
