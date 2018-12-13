@@ -95,6 +95,26 @@ def recursiveRm(path):
 	except Exception as E:
 		raise RuntimeError('failed to remove ' + path + ': ' + str(E).replace('\n', '; '))
 
+#
+##
+#
+
+def timeStringToSeconds(time_str, implied_unit = 's'):
+	unit_multipliers = { 's':1, 'S':1, 'm':60, 'M':60, 'h':3600, 'H':3600, 'd':86400, 'D':86400 }
+	try:
+		time_bits = re.match(r'^([+-]?(([0-9]*(\.[0-9]+))|([0-9]+(\.[0-9]*)?)))([smhdSMHD])?$', time_str)
+		if not time_bits:
+			return None
+		seconds = float(time_bits.group(1))
+		if time_bits.group(7):
+			implied_unit = time_bits.group(7)
+		if implied_unit in unit_multipliers:
+			seconds *= unit_multipliers[implied_unit]
+		else:
+			return None
+		return seconds
+	except:
+		return None
 
 #
 # Setup CLI arguments:
@@ -128,6 +148,15 @@ cli_parser.add_argument('--log-file', '-l',
 		metavar='<filename>', dest='log_file',
 		help='send all logging to this file instead of to stderr; timestamps are always enabled when logging to a file'
 	)
+cli_parser.add_argument('--daemon',
+		default=False, action='store_true', dest='is_daemon',
+		help='run as a daemon, periodically waking to re-check'
+	)
+cli_parser.add_argument('--daemon-period',
+		metavar='<period>', default='86400', dest='daemon_period',
+		help='wake to re-check on the given period; integer or floating-point values are acceptable with optional unit of s/m/h/d (default: s)'
+	)
+
 
 cli_args = cli_parser.parse_args()
 
@@ -168,148 +197,172 @@ if cli_args.is_special_treatment_disabled:
 #
 # Calculate age threshold:
 #
-def age_unit_to_multiplier(unit):
-	age_units = { 's':1, 'S':1, 'm':60, 'M':60, 'h':3600, 'H':3600, 'd':86400, 'D':86400 }
-	if not unit:
-		return age_units['d']
-	if unit in age_units:
-		return age_units[unit]
-	raise ValueError('invalid age threshold unit: ' + unit)
-try:
-	age_threshold_bits = re.match(r'^([+-]?(([0-9]*(\.[0-9]+))|([0-9]+(\.[0-9]*)?)))([smhdSMHD])?$', cli_args.age_threshold)
-	if not age_threshold_bits:
-		logging.error('invalid age threshold: %s', cli_args.age_threshold)
-		sys.exit(2)
-	age_threshold = int(float(age_threshold_bits.group(1)) * age_unit_to_multiplier(age_threshold_bits.group(7)))
-	logging.info('age threshold of %d second(s)', age_threshold)
-except Exception as E:
-	logging.error(str(E))
+age_threshold = timeStringToSeconds(cli_args.age_threshold, implied_unit = 'd')
+if age_threshold is None:
+	logging.error('invalid age threshold specified: %s', cli_args.age_threshold)
 	sys.exit(2)
+logging.info('age threshold of %d second(s)', age_threshold)
 
 #
-# Scan /dev/shm for all entities with modification timestamps greater than age_threshold
-# seconds ago:
+# This function does the actual scan-and-cleanup work:
 #
-cutoff_timestamp = time.time() - age_threshold
-special_cutoff_timestamp = time.time() - special_cutoff_threshold
-logging.info('cutoff timestamp for modification timestamps, standard: %d', cutoff_timestamp)
-logging.info('cutoff timestamp for modification timestamps, specials: %d', special_cutoff_timestamp)
-include_shm_entities = sets.Set()
-exclude_shm_entities = sets.Set()
-for root_dir, dirs, files in os.walk('/dev/shm', topdown=False):
-	# Check files:
-	for file in files:
-		p = os.path.join(root_dir, file)
-		if devShmPathShouldInclude(p):
-			include_shm_entities.add(firstLevelDevShmPath(p))
-		else:
-			exclude_shm_entities.add(firstLevelDevShmPath(p))
-	# Once we get to /dev/shm, scan the directories, too; but we
-	# don't let a directory's timestamp being newer exclude it from
-	# being removed -- only child files can do that:
-	if root_dir == '/dev/shm':
-		for dir in dirs:
-			p = os.path.join(root_dir, dir)
+def do_scan():
+	#
+	# Scan /dev/shm for all entities with modification timestamps greater than age_threshold
+	# seconds ago:
+	#
+	cutoff_timestamp = time.time() - age_threshold
+	special_cutoff_timestamp = time.time() - special_cutoff_threshold
+	logging.info('cutoff timestamp for modification timestamps, standard: %d', cutoff_timestamp)
+	logging.info('cutoff timestamp for modification timestamps, specials: %d', special_cutoff_timestamp)
+	include_shm_entities = sets.Set()
+	exclude_shm_entities = sets.Set()
+	for root_dir, dirs, files in os.walk('/dev/shm', topdown=False):
+		# Check files:
+		for file in files:
+			p = os.path.join(root_dir, file)
 			if devShmPathShouldInclude(p):
-				include_shm_entities.add(p)
+				include_shm_entities.add(firstLevelDevShmPath(p))
+			else:
+				exclude_shm_entities.add(firstLevelDevShmPath(p))
+		# Once we get to /dev/shm, scan the directories, too; but we
+		# don't let a directory's timestamp being newer exclude it from
+		# being removed -- only child files can do that:
+		if root_dir == '/dev/shm':
+			for dir in dirs:
+				p = os.path.join(root_dir, dir)
+				if devShmPathShouldInclude(p):
+					include_shm_entities.add(p)
 
-#
-# Get the set difference, include_shm_entities / exclude_shm_entities:
-#
-include_shm_entities -= exclude_shm_entities
+	#
+	# Get the set difference, include_shm_entities / exclude_shm_entities:
+	#
+	include_shm_entities -= exclude_shm_entities
 
-#
-# Count and summarize how many items we see:
-#
-def summarizeDevShmEntitySet(theSet, whatAreThey):
-	vader_count = 0
-	psm_count = 0
-	unknown_count = 0
-	unknown_paths = []
-	for p in theSet:
-		if 'psm2_shm' in p:
-			psm_count += 1
-		elif 'vader_segment' in p:
-			vader_count += 1
+	#
+	# Count and summarize how many items we see:
+	#
+	def summarizeDevShmEntitySet(theSet, whatAreThey):
+		vader_count = 0
+		psm_count = 0
+		unknown_count = 0
+		unknown_paths = []
+		for p in theSet:
+			if 'psm2_shm' in p:
+				psm_count += 1
+			elif 'vader_segment' in p:
+				vader_count += 1
+			else:
+				unknown_count += 1
+				unknown_paths.append(p)
+		if unknown_count > 0:
+			logging.warning('found %d %s', len(theSet), whatAreThey)
+			logging.warning('  PSM2 segments:           %8d', psm_count)
+			logging.warning('  Open MPI vader segments: %8d', vader_count)
+			logging.warning('  Unidentified items:      %8d', len(theSet) - (psm_count + vader_count))
+			for p in unknown_paths:
+				logging.warning('      %s', p)
 		else:
-			unknown_count += 1
-			unknown_paths.append(p)
-	if unknown_count > 0:
-		logging.warning('found %d %s', len(theSet), whatAreThey)
-		logging.warning('  PSM2 segments:           %8d', psm_count)
-		logging.warning('  Open MPI vader segments: %8d', vader_count)
-		logging.warning('  Unidentified items:      %8d', len(theSet) - (psm_count + vader_count))
-		for p in unknown_paths:
-			logging.warning('      %s', p)
-	else:
-		logging.info('found %d %s', len(theSet), whatAreThey)
-		if psm_count + vader_count > 0:
-			logging.info('  PSM2 segments:           %8d', psm_count)
-			logging.info('  Open MPI vader segments: %8d', vader_count)
+			logging.info('found %d %s', len(theSet), whatAreThey)
+			if psm_count + vader_count > 0:
+				logging.info('  PSM2 segments:           %8d', psm_count)
+				logging.info('  Open MPI vader segments: %8d', vader_count)
 
-summarizeDevShmEntitySet(include_shm_entities, 'removable first-level entities under /dev/shm')
+	summarizeDevShmEntitySet(include_shm_entities, 'removable first-level entities under /dev/shm')
 
-#
-# Make sure we're running as root:
-#
-if os.getuid() != 0:
-	logging.critical('scanning for active /dev/shm files requires root privileges')
-	sys.exit(1)
-
-#
-# Ask lsof to show us all open files under /dev/shm.  We can't use
-# check_output() because lsof +D will return non-zero due to files
-# present under /dev/shm that aren't in use :-\
-#
-try:
-	lsof_process = subprocess.Popen(['/usr/sbin/lsof', '-lnP', '+D', '/dev/shm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-except Exception as E:
-	logging.error(str(E))
-	sys.exit(1)
-
-#
-# We only want to check the stdout from lsof.  Scan first-level
-# paths into a set.
-#
-inuse_shm_entities = sets.Set()
-while True:
-	line = lsof_process.stdout.readline()
-	if line != b'':
-		m = firstLevelDevShmRegex.search(line.strip())
-		if m:
-			inuse_shm_entities.add(m.group(1))
-	else:
-		break
-lsof_process.wait()
-
-#
-# Count and summarize how many items we see in-use:
-#
-summarizeDevShmEntitySet(inuse_shm_entities, 'in-use first-level entities under /dev/shm')
-
-#
-# The set difference gives us what we need to remove:
-#
-remove_shm_entities = include_shm_entities - inuse_shm_entities
-if len(remove_shm_entities) < len(include_shm_entities):
-	summarizeDevShmEntitySet(remove_shm_entities, 'first-level entities under /dev/shm to be removed')
-
-if len(remove_shm_entities) > 0:
 	#
-	# Actually remove stuff -- or show that we would if we're running
-	# in dry-run mode:
+	# Make sure we're running as root:
 	#
-	if cli_args.is_dry_run:
-		logging.info('dry-run summary of actions that would be performed')
-		for p in remove_shm_entities:
-			logging.info('  rm -rf %s', p)
+	if os.getuid() != 0:
+		logging.critical('scanning for active /dev/shm files requires root privileges')
+		sys.exit(1)
+
+	#
+	# Ask lsof to show us all open files under /dev/shm.  We can't use
+	# check_output() because lsof +D will return non-zero due to files
+	# present under /dev/shm that aren't in use :-\
+	#
+	try:
+		lsof_process = subprocess.Popen(['/usr/sbin/lsof', '-lnP', '+D', '/dev/shm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	except Exception as E:
+		logging.error(str(E))
+		sys.exit(1)
+
+	#
+	# We only want to check the stdout from lsof.  Scan first-level
+	# paths into a set.
+	#
+	inuse_shm_entities = sets.Set()
+	while True:
+		line = lsof_process.stdout.readline()
+		if line != b'':
+			m = firstLevelDevShmRegex.search(line.strip())
+			if m:
+				inuse_shm_entities.add(m.group(1))
+		else:
+			break
+	lsof_process.wait()
+
+	#
+	# Count and summarize how many items we see in-use:
+	#
+	summarizeDevShmEntitySet(inuse_shm_entities, 'in-use first-level entities under /dev/shm')
+
+	#
+	# The set difference gives us what we need to remove:
+	#
+	remove_shm_entities = include_shm_entities - inuse_shm_entities
+	if len(remove_shm_entities) < len(include_shm_entities):
+		summarizeDevShmEntitySet(remove_shm_entities, 'first-level entities under /dev/shm to be removed')
+
+	if len(remove_shm_entities) > 0:
+		#
+		# Actually remove stuff -- or show that we would if we're running
+		# in dry-run mode:
+		#
+		if cli_args.is_dry_run:
+			logging.info('dry-run summary of actions that would be performed')
+			for p in remove_shm_entities:
+				logging.info('  rm -rf %s', p)
+		else:
+			logging.info('processing removal list')
+			for p in remove_shm_entities:
+				try:
+					recursiveRm(p)
+					logging.info('  OK   rm -rf %s', p)
+				except Exception as E:
+					logging.info('  FAIL rm -rf %s : %s', p, str(E))
 	else:
-		logging.info('processing removal list')
-		for p in remove_shm_entities:
-			try:
-				recursiveRm(p)
-				logging.info('  OK   rm -rf %s', p)
-			except Exception as E:
-				logging.info('  FAIL rm -rf %s : %s', p, str(E))
+		logging.warning('nothing to be removed from /dev/shm')
+
+
+#
+# Running as a daemon?
+#
+if cli_args.is_daemon:
+	#
+	# Determine how long to wait between checks:
+	#
+	daemon_period = timeStringToSeconds(cli_args.daemon_period, implied_unit = 's')
+	if daemon_period < 30:
+		logging.warning('daemon wake period limited to 30s (instead of %ds)', daemon_period)
+		daemon_period = 30
+	logging.info('daemonizing on a period of %d second(s)', daemon_period)
+
+	#
+	# We want to ignore SIGHUP instead of being killed:
+	#
+	import signal
+	signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+	#
+	# Enter our runloop; only being killed will break us out:
+	#
+	while True:
+		do_scan()
+		time.sleep(daemon_period)
 else:
-	logging.warning('nothing to be removed from /dev/shm')
+	#
+	# Single run only:
+	#
+	do_scan()
