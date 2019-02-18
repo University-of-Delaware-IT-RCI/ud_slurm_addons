@@ -1,0 +1,177 @@
+#!/bin/bash
+#
+# Mimic the qquota Grid Engine command back on Mills/Farber.  For the
+# current workgroup or one explicitly provided, grab the current QOS limit
+# and compare against the resources requested by jobs running in that
+# workgroup's partition.
+#
+
+WORKGROUP_NAME=""
+OUTPUT_FORMAT="text"
+
+usage() {
+    cat <<EOT
+usage:
+
+    $1 {options}
+
+  options:
+
+    -h/--help               show this information
+
+    --json                  output in JSON format; the default is
+                            a simple textual summary readable by
+                            human beings
+    --yaml                  output in YAML format
+
+    -g <workgroup>, --group=<workgroup>
+                            display a specific workgroup (by name)
+                            without this flag, the Unix group of the
+                            calling process is used
+
+EOT
+    exit 0
+}
+
+#
+# Process any CLI options:
+#
+POSITIONAL_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage "$0"
+            ;;
+        -g|--group|--workgroup)
+            if [ -z "$2" ]; then
+                echo "ERROR:  no workgroup name provided"
+                exit 1
+            fi
+            shift
+            WORKGROUP_NAME="$1"
+            ;;
+        --group=*|--workgroup=*)
+            if [[ $1 =~ --(work)?group=([A-Za-z0-9_]+) ]]; then
+                WORKGROUP_NAME="${BASH_REMATCH[2]}"
+            else
+                echo "ERROR:  invalid workgroup name: $1"
+                exit 1
+            fi
+            ;;
+        --json)
+            OUTPUT_FORMAT=json
+            ;;
+        --yaml)
+            OUTPUT_FORMAT=yaml
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            ;;
+    esac
+    shift
+done
+# Restore position args:
+set -- "${POSITIONAL_ARGS[@]}"
+
+#
+# Validate the workgroup choice:
+#
+if [ -z "$WORKGROUP_NAME" ]; then
+    if [ "$(id -g)" -eq 900 ]; then
+        echo "ERROR:  please choose a workgroup or use the -g/--group flag to specify one"
+        exit 1
+    fi
+    WORKGROUP_NAME="$(id -gn)"
+fi
+
+#
+# Lookup QOS limits:
+#
+QOS_LIMITS="$(sacctmgr --parsable --noheader show qos "$WORKGROUP_NAME" 2>&1 | cut -d\| -f9)"
+if [ $? -ne 0 ]; then
+    echo "ERROR:  unable to lookup QOS limits for workgroup $WORKGROUP_NAME"
+    exit 1
+fi
+if [[ $QOS_LIMITS =~ cpu=([0-9]+) ]]; then
+    CPU_LIMITS="${BASH_REMATCH[1]}"
+else
+    CPU_LIMITS=0
+fi
+if [[ $QOS_LIMITS =~ mem=([0-9]+)([TGMtgm]) ]]; then
+    MEM_LIMITS="${BASH_REMATCH[1]}"
+    case "${BASH_REMATCH[2]}" in
+        t|T)
+            MEM_LIMITS=$((MEM_LIMITS*1024*1024))
+            ;;
+        g|G)
+            MEM_LIMITS=$((MEM_LIMITS*1024))
+            ;;
+        *)
+            ;;
+    esac
+else
+    MEM_LIMITS=0
+fi
+
+#
+# Lookup current usage levels:
+#
+USAGE_LEVELS="$(squeue --partition="$WORKGROUP_NAME" --state=running --format="%m %C" --noheader --noconvert 2>/dev/null| awk '{m+=$1;c+=$2;}END{printf("%d:%d\n",m,c);}')"
+if [ $? -ne 0 ]; then
+    echo "ERROR:  unable to lookup current usage levels"
+    exit 1
+fi
+if [[ $USAGE_LEVELS =~ ([0-9]+):([0-9]+) ]]; then
+    MEM_USAGE="${BASH_REMATCH[1]}"
+    CPU_USAGE="${BASH_REMATCH[2]}"
+else
+    echo "ERROR:  unable to interpret usage levels"
+    exit 1
+fi
+
+#
+# Display summary:
+#
+if [ $OUTPUT_FORMAT = json ]; then
+    printf "{ "
+fi
+if [ $CPU_LIMITS -gt 0 ]; then
+    CPU_PCT="$(bc <<EOT
+scale=1; 100 * $CPU_USAGE / $CPU_LIMITS
+EOT
+)"
+    case $OUTPUT_FORMAT in
+        json)
+            printf "\"cpu\": { \"usage\": %d, \"limit\": %d }" "$CPU_USAGE" "$CPU_LIMITS"
+            ;;
+        yaml)
+            printf "cpu:\n    usage: %d\n    limit: %d\n" "$CPU_USAGE" "$CPU_LIMITS"
+            ;;
+        text)
+            printf "cpu=%d/%d\t%.1f%%\n" "$CPU_USAGE" "$CPU_LIMITS" "$CPU_PCT"
+            ;;
+    esac
+fi
+if [ $MEM_LIMITS -gt 0 ]; then
+    MEM_PCT="$(bc <<EOT
+scale=1; 100 * $MEM_USAGE / $MEM_LIMITS
+EOT
+)"
+    case $OUTPUT_FORMAT in
+        json)
+            if [ $CPU_LIMITS -gt 0 ]; then
+                printf ", "
+            fi
+            printf "\"mem\": { \"usage\": %d, \"limit\": %d }" "$MEM_USAGE" "$MEM_LIMITS"
+            ;;
+        yaml)
+            printf "mem:\n    usage: %d\n    limit: %d\n" "$MEM_USAGE" "$MEM_LIMITS"
+            ;;
+        text)
+            printf "mem=%d/%d\t%.1f%%\n" "$MEM_USAGE" "$MEM_LIMITS" "$MEM_PCT"
+            ;;
+    esac
+fi
+if [ $OUTPUT_FORMAT = json ]; then
+    printf " }\n"
+fi

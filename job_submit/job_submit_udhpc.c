@@ -1268,6 +1268,24 @@ job_submit(
 
 #endif
 
+  /* Log exclusivity info when applicable: */
+  if ( job_desc->shared != NO_VAL16 ) {
+    switch ( job_desc->shared ) {
+      case JOB_SHARED_NONE:
+        info(PLUGIN_SUBTYPE ": exclusive selected");
+        break;
+      case JOB_SHARED_USER:
+        info(PLUGIN_SUBTYPE ": exclusive=user selected");
+        break;
+      case JOB_SHARED_MCS:
+        info(PLUGIN_SUBTYPE ": exclusive=mcs selected (!!) -- rejecting job");
+        if ( err_msg ) {
+          *err_msg = xstrdup_printf("MCS is not enabled on this cluster, so you cannot use --exclusive=mcs");
+        }
+        return SLURM_ERROR;
+    }
+  }
+
   /* Memory limit _must_ be set: */
   if ( (job_desc->pn_min_memory <= 0) || (job_desc->pn_min_memory == NO_VAL64) ) {
     job_desc->pn_min_memory = udhpc_min_mem_mb | MEM_PER_CPU;
