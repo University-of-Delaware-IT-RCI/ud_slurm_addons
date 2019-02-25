@@ -426,6 +426,14 @@ class WorkgroupLimits(object):
 					telem = telem.split('=', 1)
 					if telem[0].startswith('gres/'):
 						self.gres[telem[0][5:]] = int(telem[1])
+					elif telem[0] == 'mem':
+					    m = re.match(r'^([0-9]+)([TGM])?$', telem[1])
+					    if m is not None:
+					        self.tres[telem[0]] = int(m.group(1))
+					        if m.group(2) == 'T':
+					            self.tres[telem[0]] = self.tres[telem[0]] * 1024 * 1024
+					        elif m.group(2) == 'G':
+					            self.tres[telem[0]] = self.tres[telem[0]] * 1024
 					else:
 						self.tres[telem[0]] = int(telem[1])
 	
@@ -564,7 +572,7 @@ if len(joblist) > 0:
 			output_format = '{1:24s}{2:>12d}{3:>12d}'
 			header_format = '{1:24s}{2:>12s}{3:>12s}{4:>12s}{5:>12s}'
 		ext_output_format = output_format + '{4:>12d}{5:>12d}'
-		print header_format.format('WORKGROUP', 'PARTITION', 'NODES', 'CPUS', 'MAX NODES', 'MAX CPUS')
+		print header_format.format('WORKGROUP', 'PARTITION', 'NODES', 'CPUS', 'MAX MEM', 'MAX CPUS')
 		print header_format.format('-'*24, '-'*24, '-'*12, '-'*12, '-'*12, '-'*12)
 		account_aggr = None
 		total_aggr = JobInfo()
@@ -580,7 +588,7 @@ if len(joblist) > 0:
 			if partition.account == partition.partition:
 				if partition.account in workgroup_limits:
 					limits = workgroup_limits[partition.account]
-					print ext_output_format.format(partition.account, partition.partition, partition.nnodes, partition.ncpus, limits.tres['node'], limits.tres['cpu'])
+					print ext_output_format.format(partition.account, partition.partition, partition.nnodes, partition.ncpus, limits.tres['mem'], limits.tres['cpu'])
 			else:
 				print output_format.format(partition.account, partition.partition, partition.nnodes, partition.ncpus)
 		if len(argv.grouplist) > 1 and account_aggr:
