@@ -1,177 +1,159 @@
-#!/bin/bash
+#!/usr/bin/python
 #
-# Mimic the qquota Grid Engine command back on Mills/Farber.  For the
-# current workgroup or one explicitly provided, grab the current QOS limit
-# and compare against the resources requested by jobs running in that
-# workgroup's partition.
+# squota
+#
+# Display workgroup resource limits and current usage of those
+# limits.
 #
 
-WORKGROUP_NAME=""
-OUTPUT_FORMAT="text"
+import os
+import sys
+import subprocess
+import re
+import argparse
 
-usage() {
-    cat <<EOT
-usage:
-
-    $1 {options}
-
-  options:
-
-    -h/--help               show this information
-
-    --json                  output in JSON format; the default is
-                            a simple textual summary readable by
-                            human beings
-    --yaml                  output in YAML format
-
-    -g <workgroup>, --group=<workgroup>
-                            display a specific workgroup (by name)
-                            without this flag, the Unix group of the
-                            calling process is used
-
-EOT
-    exit 0
-}
+def parse_tres(tres_str):
+    resource_limits = dict()
+    for kvpair in tres_str.split(','):
+        kvpair = kvpair.split('=', 1)
+        v = kvpair[1]
+        m = re.match(r'^(\d+)(.*)$', v)
+        if m is not None:
+            v = int(m.group(1))
+            if m.group(2) == 'G':
+                v = v * 1024
+            elif m.group(2) == 'T':
+                v = v * 1024 * 1024
+            elif m.group(2) == 'P':
+                v = v * 1024 * 1024 * 1024
+        resource_limits[kvpair[0]] = v
+    return resource_limits
 
 #
-# Process any CLI options:
+# Process command-line arguments:
 #
-POSITIONAL_ARGS=()
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -h|--help)
-            usage "$0"
-            ;;
-        -g|--group|--workgroup)
-            if [ -z "$2" ]; then
-                echo "ERROR:  no workgroup name provided"
-                exit 1
-            fi
-            shift
-            WORKGROUP_NAME="$1"
-            ;;
-        --group=*|--workgroup=*)
-            if [[ $1 =~ --(work)?group=([A-Za-z0-9_]+) ]]; then
-                WORKGROUP_NAME="${BASH_REMATCH[2]}"
-            else
-                echo "ERROR:  invalid workgroup name: $1"
-                exit 1
-            fi
-            ;;
-        --json)
-            OUTPUT_FORMAT=json
-            ;;
-        --yaml)
-            OUTPUT_FORMAT=yaml
-            ;;
-        *)
-            POSITIONAL_ARGS+=("$1")
-            ;;
-    esac
-    shift
-done
-# Restore position args:
-set -- "${POSITIONAL_ARGS[@]}"
+arg_parser = argparse.ArgumentParser(
+			description = 'Display workgroup resource quota usage')
+
+arg_parser.add_argument('--json',
+	action = 'store_const',
+	dest = 'format',
+	const = 'json',
+	help = 'output in JSON format')
+arg_parser.add_argument('--yaml',
+	action = 'store_const',
+	dest = 'format',
+	const = 'yaml',
+	help = 'output in YAML format')
+arg_parser.add_argument('-g', '--group',
+	dest = 'group',
+	metavar = '<workgroup>',
+	help = 'display a specific workgroup (by name); without this flag, the Unix group of the calling process is used')
+
+argv = arg_parser.parse_args()
 
 #
-# Validate the workgroup choice:
+# Set default values if none were explicitly provided:
 #
-if [ -z "$WORKGROUP_NAME" ]; then
-    if [ "$(id -g)" -eq 900 ]; then
-        echo "ERROR:  please choose a workgroup or use the -g/--group flag to specify one"
-        exit 1
-    fi
-    WORKGROUP_NAME="$(id -gn)"
-fi
+if not argv.format:
+    argv.format = 'text'
+
+if not argv.group:
+    import grp
+    argv.group = grp.getgrgid(os.getgid()).gr_name
 
 #
-# Lookup QOS limits:
+# Get QOS limits:
 #
-QOS_LIMITS="$(sacctmgr --parsable --noheader show qos "$WORKGROUP_NAME" 2>&1 | cut -d\| -f9)"
-if [ $? -ne 0 ]; then
-    echo "ERROR:  unable to lookup QOS limits for workgroup $WORKGROUP_NAME"
-    exit 1
-fi
-if [[ $QOS_LIMITS =~ cpu=([0-9]+) ]]; then
-    CPU_LIMITS="${BASH_REMATCH[1]}"
-else
-    CPU_LIMITS=0
-fi
-if [[ $QOS_LIMITS =~ mem=([0-9]+)([TGMtgm]) ]]; then
-    MEM_LIMITS="${BASH_REMATCH[1]}"
-    case "${BASH_REMATCH[2]}" in
-        t|T)
-            MEM_LIMITS=$((MEM_LIMITS*1024*1024))
-            ;;
-        g|G)
-            MEM_LIMITS=$((MEM_LIMITS*1024))
-            ;;
-        *)
-            ;;
-    esac
-else
-    MEM_LIMITS=0
-fi
+sacctmgr_args = ['sacctmgr', '--parsable', '--noheader', 'show', 'qos', argv.group];
+sacctmgr_output = subprocess.check_output(sacctmgr_args)
+sacctmgr_output = sacctmgr_output.split('|')
+if len(sacctmgr_output) < 9 or not sacctmgr_output[8]:
+    sys.stderr.write('ERROR:  unable to retrieve resource limits for workgroup ' + argv.group + '\n')
+    sys.exit(1)
+resource_limits = parse_tres(sacctmgr_output[8])
 
 #
-# Lookup current usage levels:
+# No limits?
 #
-USAGE_LEVELS="$(squeue --partition="$WORKGROUP_NAME" --state=running --format="%m %C" --noheader --noconvert 2>/dev/null| awk '{m+=$1;c+=$2;}END{printf("%d:%d\n",m,c);}')"
-if [ $? -ne 0 ]; then
-    echo "ERROR:  unable to lookup current usage levels"
-    exit 1
-fi
-if [[ $USAGE_LEVELS =~ ([0-9]+):([0-9]+) ]]; then
-    MEM_USAGE="${BASH_REMATCH[1]}"
-    CPU_USAGE="${BASH_REMATCH[2]}"
-else
-    echo "ERROR:  unable to interpret usage levels"
-    exit 1
-fi
+if len(resource_limits) == 0:
+    print 'No resource limits found for workgroup ' + argv.group + '\n'
 
 #
-# Display summary:
+# Get TRES levels for all running jobs:
 #
-if [ $OUTPUT_FORMAT = json ]; then
-    printf "{ "
-fi
-if [ $CPU_LIMITS -gt 0 ]; then
-    CPU_PCT="$(bc <<EOT
-scale=1; 100 * $CPU_USAGE / $CPU_LIMITS
-EOT
-)"
-    case $OUTPUT_FORMAT in
-        json)
-            printf "\"cpu\": { \"usage\": %d, \"limit\": %d }" "$CPU_USAGE" "$CPU_LIMITS"
-            ;;
-        yaml)
-            printf "cpu:\n    usage: %d\n    limit: %d\n" "$CPU_USAGE" "$CPU_LIMITS"
-            ;;
-        text)
-            printf "cpu=%d/%d\t%.1f%%\n" "$CPU_USAGE" "$CPU_LIMITS" "$CPU_PCT"
-            ;;
-    esac
-fi
-if [ $MEM_LIMITS -gt 0 ]; then
-    MEM_PCT="$(bc <<EOT
-scale=1; 100 * $MEM_USAGE / $MEM_LIMITS
-EOT
-)"
-    case $OUTPUT_FORMAT in
-        json)
-            if [ $CPU_LIMITS -gt 0 ]; then
-                printf ", "
-            fi
-            printf "\"mem\": { \"usage\": %d, \"limit\": %d }" "$MEM_USAGE" "$MEM_LIMITS"
-            ;;
-        yaml)
-            printf "mem:\n    usage: %d\n    limit: %d\n" "$MEM_USAGE" "$MEM_LIMITS"
-            ;;
-        text)
-            printf "mem=%d/%d\t%.1f%%\n" "$MEM_USAGE" "$MEM_LIMITS" "$MEM_PCT"
-            ;;
-    esac
-fi
-if [ $OUTPUT_FORMAT = json ]; then
-    printf " }\n"
-fi
+squeue_args = ['squeue', '--parseable', '--noheader', '--Format=tres', '--state=running', '--account=' + argv.group, '--partition=' + argv.group]
+squeue_output = subprocess.check_output(squeue_args)
+resource_usage = dict()
+for tres_str in squeue_output.split('\n'):
+    if tres_str:
+        job_resources = parse_tres(tres_str)
+        for (k,v) in job_resources.iteritems():
+            if k in resource_usage:
+                if isinstance(v, basestring) or isinstance(v, str):
+                    resource_usage[k] = resource_usage[k] + ',' + v
+                else:
+                    resource_usage[k] = resource_usage[k] + v
+            else:
+                resource_usage[k] = v
+
+#
+# Drop the "billing" thingy if present:
+#
+resource_usage.pop('billing', None)
+
+#
+# Loop over the used resources.  If a limit exists, display the level, limit,
+# and percentage.
+#
+output = dict()
+for (k,v) in resource_usage.iteritems():
+    d = { 'usage': v }
+    if k in resource_limits:
+        d['limit'] = resource_limits[k]
+        if not (isinstance(v, basestring) or isinstance(v, str)):
+            d['percentage'] = float(v) / float(resource_limits[k]) * 100.0
+    output[k] = d
+#
+# Check for any limits for which we have no usage, and add those, too:
+#
+for (k,v) in resource_limits.iteritems():
+    if k not in output:
+        output[k] = { 'usage': 0, 'limit': v, 'percentage': 0.0 }
+
+#
+# Output the info:
+#
+if argv.format == 'text':
+    header_labels = ['resource', 'used', 'limit', 'pct']
+    col_width = [ len(s) for s in header_labels ]
+    for (k,v) in output.iteritems():
+        if len(k) > col_width[0]: col_width[0] = len(k)
+        if len(str(v['usage'])) > col_width[1]: col_width[1] = len(str(v['usage']))
+        if 'limit' in v:
+            if len(str(v['limit'])) > col_width[2]: col_width[2] = len(str(v['limit']))
+            p = int(v['percentage'])
+            l = 3
+            if p >= 9.95:
+                if p >= 99.95:
+                    l = 5
+                else:
+                    l = 4
+            if l > col_width[3]: col_width[3] = l
+
+    limit_format_str = '{{:{:d}s}} {{:{:d}d}} {{:{:d}d}} {{:{:d}.1f}}%'.format(*col_width)
+    unlimit_format_str = '{{:{:d}s}} {{:{:d}d}}'.format(col_width[0], col_width[1])
+    header_format_str = '{{:{:d}s}} {{:>{:d}s}} {{:>{:d}s}} {{:>{:d}s}}'.format(col_width[0], col_width[1], col_width[2], col_width[3] + 1)
+    print header_format_str.format(*header_labels)
+    print header_format_str.format('~'*col_width[0], '~'*col_width[1], '~'*col_width[2], '~'*(col_width[3] + 1))
+    for (k,v) in output.iteritems():
+        if 'limit' in v:
+            print limit_format_str.format(k, v['usage'], v['limit'], v['percentage'])
+        else:
+            print unlimit_format_str.format(k, v['usage'])
+elif argv.format == 'json':
+    import json
+    print json.dumps(output)
+elif argv.format == 'yaml':
+    import yaml
+    print yaml.dump(output, default_flow_style=False)
