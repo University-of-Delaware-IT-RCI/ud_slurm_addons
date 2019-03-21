@@ -11,56 +11,70 @@ import subprocess
 
 class JobRecord(object):
 
-    def __init__(self, jobRecStr):
+    def __init__(self, headerStr, jobSummaryStr):
         self.properties = dict()
         self._notes = ''
-        while jobRecStr:
-            (key, dummy, rest) = jobRecStr.partition('=')
-            # Got the key, now the value:
-            i = 0
-            while i < len(rest):
-                while i < len(rest) and rest[i] != ' ': i = i + 1
-                if  i < len(rest) and rest[i] == ' ':
-                    # Look ahead -- [[:alpha:]]= ?
-                    j = i + 1
-                    while j < len(rest) and rest[j].isalpha(): j = j + 1
-                    if j < len(rest) and rest[j] == '=':
-                        # Got it:
-                        self.properties[key] = rest[:i]
-                        jobRecStr = rest[i+1:]
-                        i = -1
-                        break
-                    i = j
-            if i >= 0:
-                self.properties[key] = rest
-                jobRecStr = ''
 
-            # Add synthetic properties:
-            if 'StartTime' in self.properties and 'EndTime' in self.properties:
-                startTime = self.timeValueForKey('StartTime')
-                endTime = self.timeValueForKey('EndTime')
-                actualWallTime = (endTime - startTime) / 60.0
-                self.properties['ActualWallTime'] = '{:.2f}'.format(actualWallTime)
-                if 'TimeLimit' in self.properties:
-                    self.properties['WallTimePctOfLimit'] = '{:.2f}%'.format(100.0 * actualWallTime / float(self.properties['TimeLimit']))
+        self.properties = dict(zip(headerStr.split('|'), jobSummaryStr.split('|')))
 
-    def __str__(self):
-        outStr = '{:s} ({:s}) {{\n'.format(self.fullJobId(), self.notes())
-        for key,value in self.properties.iteritems():
-            outStr = outStr + '  {:s}: "{:s}"\n'.format(key, str(value))
+        # Add synthetic properties:
+        if 'Start' in self.properties and 'End' in self.properties:
+            startTime = self.timeValueForKey('Start')
+            endTime = self.timeValueForKey('End')
+            actualWallTime = (endTime - startTime)
+            seconds = actualWallTime
+            if seconds >= 86400.0:
+                days = int(seconds / 86400.0)
+                seconds = seconds - (86400 * days)
+            else:
+                days = 0
+            if seconds >= 3600.0:
+                hours = int(seconds / 3600.0)
+                seconds = seconds - (3600 * hours)
+            else:
+                hours = 0
+            if seconds >= 60.0:
+                minutes = int(seconds / 60.0)
+                seconds = seconds - (60 * minutes)
+            else:
+                minutes = 0
+            seconds = int(seconds)
+
+            if days > 0:
+                self.properties['ActualWallTime'] = '{:d}-{:02d}:{:02d}:{:02d}'.format(days,hours,minutes,seconds)
+            else:
+                self.properties['ActualWallTime'] = '{:02d}:{:02d}:{:02d}'.format(hours,minutes,seconds)
+            if 'Timelimit' in self.properties:
+                if self.properties['Timelimit'] == 'UNLIMITED':
+                    self.properties['WallTimePctOfLimit'] = '0.00%'
+                else:
+                    self.properties['WallTimePctOfLimit'] = '{:.2f}%'.format(
+                                        100.0 * actualWallTime / self.durationValueForKey('Timelimit')
+                                )
+
+    def toStr(self, shouldSortKeys = False):
+        outStr = '{:s} ({:s}) {{\n'.format(self.properties['JobID'], self.notes())
+        if shouldSortKeys:
+            keys = self.properties.keys()
+            keys.sort()
+            for key in keys:
+                outStr = outStr + '  {:s}: "{:s}"\n'.format(key, str(self.properties[key]))
+        else:
+            for key, value in self.properties.iteritems():
+                outStr = outStr + '  {:s}: "{:s}"\n'.format(key, str(value))
         outStr = outStr + '}\n'
         return outStr
 
-    def fullJobId(self):
-        jobId = self.properties['JobId']
-        if 'ArrayJobId' in self.properties and len(self.properties['ArrayJobId']) > 0:
-            jobId = jobId + '_' + self.properties['ArrayJobId']
-        return jobId
+    def checkState(self, keywords):
+        for keyword in keywords:
+            if keyword in self.properties['State']: return True
+        return False
 
-    def actualWallTime(self):
-        startTime = self.timeValueForKey('StartTime')
-        endTime = self.timeValueForKey('EndTime')
-        return (endTime - startTime)
+    def jobId(self):
+        return self.properties['JobID']
+
+    def isArrayJob(self):
+        return self.properties['JobID'] != self.properties['JobIDRaw']
 
     def notes(self):
         return self._notes
@@ -76,6 +90,22 @@ class JobRecord(object):
     def intValueForKey(self, key):
         if key in self.properties:
             return int(self.properties[key])
+        raise NameError("key '{:s}' is not defined".format(key))
+
+    def durationValueForKey(self, key):
+        if key in self.properties:
+            val = self.properties[key]
+            if val == 'UNLIMITED': return -1
+
+            if '-' in val:
+                (days, dummy, hours) = val.partition('-')
+            else:
+                days = '0'
+                hours = val
+            pieces = hours.split(':')
+            if len(pieces) == 3:
+                return float(pieces[2]) + 60.0 * (60.0 * (24.0 * float(days) + float(pieces[0])) + float(pieces[1]))
+            raise ValueError("'{:s}' is not a valid duration".format(self.properties[key]))
         raise NameError("key '{:s}' is not defined".format(key))
 
     def timeValueForKey(self, key):
@@ -108,8 +138,15 @@ cli_parser.add_argument(
                 help='Always prefix output lines with job id'
             )
 cli_parser.add_argument(
+                '--sort-properties',
+                dest='shouldSortProperties',
+                action='store_true',
+                default=False,
+                help='For verbose output, show properties in alphabetized order'
+            )
+cli_parser.add_argument(
                 '--jobid', '-j',
-                metavar='<job-id>',
+                metavar='<job-id>{,<job-id>..}',
                 action='append',
                 dest='jobIds',
                 help='Slurm job id to check; can be used multiple times to check more than one job.  For array jobs, use the syntax #_# for individual array indices'
@@ -121,63 +158,43 @@ if not cli_args.jobIds or len(cli_args.jobIds) == 0:
     sys.exit(1)
 
 #
-# Turn the job ids into a set:
+# Turn the job ids into a set, splitting any comma-delimited
+# values into multiple values:
 #
-jobIds = set(cli_args.jobIds)
+jobIds = []
+for jobId in cli_args.jobIds:
+    if ',' in jobId:
+        jobIds.extend(jobId.split(','))
+    else:
+        jobIds.append(jobId)
+jobIds = set(jobIds)
 
 #
-# Get base job ids (sans array task id):
+# Grab header and summary lines for each job id
+# from sacct:
 #
-def baseJobId(jobId):
-    if '_' in jobId:
-        return jobId[:jobId.find('_')]
-    return jobId
-baseJobIds = set([(j[:j.find('_')] if '_' in j else j) for j in jobIds])
-
-#
-# Scan the completion log:
-#
-with open('/var/log/slurm/jobcomp/completion.log', 'r') as log_file:
-    foundJobs = []
-    line = log_file.readline()
-    lastJobId=''
-    while len(jobIds) > 0 and line:
-        if line.startswith('JobId='):
-            (jobId, dummy1, dummy2) = line[6:].partition(' ')
-            if jobId in baseJobIds:
-                # At this point, let's parse the completion line:
-                theJob = JobRecord(line.strip())
-
-                task_id = theJob.valueForKey('ArrayJobId', None)
-                if task_id is not None:
-                    #
-                    # For an array job, we want to check this job if the
-                    # overarching job id was provided OR if the exact
-                    # job id + task was provided:
-                    #
-                    if jobId in jobIds or (jobId + '_' + task_id) in jobIds:
-                        try:
-                            jobIds.remove(jobId + '_' + task_id)
-                        except:
-                            pass
-                        shouldCheck = True
-                else:
-                    shouldCheck = True
-
-                if shouldCheck and theJob.valueForKey('Partition', '') == 'standard':
+foundJobs = []
+for jobId in jobIds:
+    try:
+        acctInfo = subprocess.check_output(['sacct', '--parsable2', '--format=ALL', '--job=' + jobId])
+        if acctInfo:
+            lines = acctInfo.split('\n')
+            if len(lines) >= 2:
+                theJob = JobRecord(lines[0], lines[1])
+                if theJob.valueForKey('Partition', '') == 'standard':
                     shouldDisplay = False
-                    if theJob.valueForKey('JobState', '') == 'PREEMPTED':
+                    if theJob.checkState(['PREEMPTED']):
                         shouldDisplay = True
                         theJob.setNotes('preempted, reached grace period limit')
-                    elif theJob.valueForKey('JobState', '') != 'COMPLETED':
+                    elif not theJob.checkState(['COMPLETED', 'CANCELLED']):
                         #
                         # Grab the TimeLimit, StartTime, and EndTime, then calculate
                         # the difference between actual and submitted EndTime:
                         #
-                        timeLimit = int(theJob.valueForKey('TimeLimit', -1))
-                        startTime = theJob.timeValueForKey('StartTime')
-                        endTime = theJob.timeValueForKey('EndTime')
-                        deltaTime = abs(endTime - (startTime + timeLimit * 60))
+                        timeLimit = theJob.durationValueForKey('Timelimit')
+                        startTime = theJob.timeValueForKey('Start')
+                        endTime = theJob.timeValueForKey('End')
+                        deltaTime = abs(endTime - (startTime + timeLimit))
 
                         # If deltaTime is more than 5 minutes, the job was preempted:
                         shouldDisplay = (deltaTime >= 5 * 60)
@@ -186,25 +203,21 @@ with open('/var/log/slurm/jobcomp/completion.log', 'r') as log_file:
 
                     if shouldDisplay:
                         foundJobs.append(theJob)
-            if len(lastJobId) > 0 and jobId != lastJobId:
-                if lastJobId in jobIds: jobIds.remove(lastJobId)
-                if lastJobId in baseJobIds: baseJobIds.remove(lastJobId)
-            lastJobId = jobId
-
-        line = log_file.readline()
+    except Exception as E:
+        print str(E)
 
 # Display what we found:
 if len(foundJobs) > 0:
     if cli_args.isVerbose:
         for aJob in foundJobs:
-            sys.stdout.write(str(aJob))
+            sys.stdout.write(aJob.toStr(cli_args.shouldSortProperties))
     elif not cli_args.isQuiet:
         if len(foundJobs) > 1 or cli_args.shouldShowJobId:
             out_format = '{0}: {1}\n'
         else:
             out_format = '{1}\n'
         for aJob in foundJobs:
-            sys.stdout.write(out_format.format(aJob.fullJobId(), aJob.notes()))
+            sys.stdout.write(out_format.format(aJob.jobId(), aJob.notes()))
     sys.exit(1)
 
 sys.exit(0)
