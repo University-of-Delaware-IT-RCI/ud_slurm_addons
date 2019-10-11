@@ -1,0 +1,445 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# ssheet_driver
+#
+# This multi-tool script looks at the command name to determine what underlying
+# Slurm tool is being wrapped:  "ssqueue" wraps "squeue".  Hard links or symlinks
+# can be used to alias each wrapper to this single driver script.
+#
+# Executes the wrapped command with whatever additional arguments were presented
+# to the wrapper.  All output from the wrapped command is analyzed to make a
+# data array with headers that's then displayed in a scrolling view using the
+# curses library.
+#
+
+import os
+import sys
+import re
+import errno
+import curses
+import locale
+import subprocess
+import functools
+
+#
+# The commands we can actually wrap:
+#
+valid_wrapped_cmds = ('squeue', 'sinfo', 'sacct', 'sstat', 'sshare')
+
+#
+# If the user provides these flags, drop them from the argument list passed
+# to the original command:
+#
+dropped_flags = ('-h', '--noheader', '--parsable', '--parsable2', '--parseable')
+
+#
+# Add these flags to the wrapped commands to get the expected display format:
+#
+added_flags = {
+        'squeue': ['--parsable'],
+        'sacct': ['--parsable'],
+        'sinfo': ['--parseable'],
+        'sstat': ['--parsable'],
+        'sshare': ['--parsable'],
+    }
+
+
+class text_align:
+    """Static class used to represent the text alignment options for cells."""
+    
+    ALIGN_LEFT = '<'
+    ALIGN_CENTER = '^'
+    ALIGN_RIGHT = '>'
+    
+    @staticmethod
+    def is_valid_text_align(mode):
+        """Returns True is the incoming character is an acceptable alignment mode."""
+        return mode in '<^>'
+
+
+class sheet(object):
+    """Model class that represents an array (rows x columns) of textual data with column headers.
+
+The class allows rows of data to be dynamically added.  Methods exist to fetch the data dimension (row and column count) as well as the overall window dimension (max character width and height of the displayed data).
+
+By default all cells are left-aligned.  The fixup_alignment() method analyzes columns and any displaying purely numerical data are right-aligned."""
+
+    def __init__(self, headers=None, rows=None, default_alignment=text_align.ALIGN_LEFT):
+        if not text_align.is_valid_text_align(default_alignment):
+            raise RuntimeError('Invalid text alignment mode "{:s}"'.format(default_alignment))
+        self._headers = []
+        self._array = []
+        self._alignment = []
+        self._default_alignment = default_alignment
+        if headers is not None:
+            self.add_headers(headers)
+        if rows is not None:
+            self.add_rows(rows)
+        
+    def __clear_caches(self):
+        self._data_dimension = None
+        self._column_widths = None
+        self._window_dimension = None
+    
+    def add_header(self, header_text):
+        self._headers.append(header_text)
+        self._alignment.append(self._default_alignment)
+        self.__clear_caches()
+    
+    def add_headers(self, header_list):
+        self._headers.extend(header_list)
+        self._alignment.extend([self._default_alignment]*len(header_list))
+        self.__clear_caches()
+    
+    def add_row(self, row):
+        r = [str(s) for s in row]
+        self._array.append(r)
+        if len(r) > len(self._alignment):
+            self._alignment.extend([self._default_alignment]*(len(r) - len(self._alignment)))
+        self.__clear_caches()
+    
+    def add_rows(self, rows):
+        for row in rows:
+            r = [str(s) for s in row]
+            self._array.append(r)
+            if len(r) > len(self._alignment):
+                self._alignment.extend([self._default_alignment]*(len(r) - len(self._alignment)))
+        self.__clear_caches()
+    
+    def data_dimension(self):
+        if self._data_dimension is None:
+            w = len(self._headers)
+            h = len(self._array)
+        
+            # Is the array wider than the headers?
+            w = max([w, max([ len(s) for s in self._array])])
+
+            self._data_dimension = (h, w)
+        return self._data_dimension
+        
+    def column_widths(self):
+        if self._column_widths is None:
+            (h, w) = self.data_dimension()
+        
+            col_widths = [0]*w
+            for i in range(0, len(self._headers)):
+                col_widths[i] = len(self._headers[i])
+        
+            for row in self._array:
+                for i in range(0, len(row)):
+                    if len(row[i]) > col_widths[i]:
+                        col_widths[i] = len(row[i])
+            self._column_widths = col_widths
+        return self._column_widths
+    
+    def set_alignment(self, column_num, alignment=None):
+        if alignment is None or text_align.is_valid_text_align(alignment):
+            (h, w) = self.data_dimension()
+            if column_num > 0 and column_num < w:
+                self._alignment[column_num] = alignment if (alignment is None) else self._default_alignment
+            else:
+                raise IndexError('Column index out of range')
+        else:
+            raise RuntimeError('Invalid text alignment mode')
+    
+    def fixup_alignment(self):
+        #
+        # Search for columns containing all empty/numeric data:
+        #
+        (h, w) = self.data_dimension()
+        for j in range(0, w):
+            nope = False
+            for i in range(0, h):
+                if len(self._array[i]) > j:
+                    if len(self._array[i][j]) != 0:
+                        try:
+                            r = float(self._array[i][j])
+                        except:
+                            nope = True
+                            break
+            if not nope:
+                self._alignment[j] = text_align.ALIGN_RIGHT
+    
+    def window_dimension(self):
+        if self._window_dimension is None:
+            (h, w) = self.data_dimension()
+            dd = self.column_widths()
+            w = functools.reduce(lambda a,b : a+b, dd)
+            if w > 0:
+                w = w + 3 * (len(dd) - 1)
+            self._window_dimension = (h, w)
+        return self._window_dimension
+
+    def write_header_to_pad(self, the_pad):
+        col_widths = self.column_widths()
+        x = 0
+        for i in range(0, len(self._headers)):
+            the_pad.addstr(0, x, ('{:' + self._alignment[i] + str(col_widths[i]) + 's}').format(self._headers[i]), curses.A_STANDOUT)
+            for j in range(0, col_widths[i]):
+                the_pad.addch(1, x, curses.ACS_BSBS)
+                x = x + 1
+            if i < len(self._headers) - 1:
+                the_pad.addch(0, x, ' ')
+                the_pad.addch(1, x, curses.ACS_BSBS)
+                x = x + 1
+                the_pad.addch(0, x, curses.ACS_SBSB)
+                the_pad.addch(1, x, curses.ACS_SSSS)
+                x = x + 1
+                the_pad.addch(0, x, ' ')
+                the_pad.addch(1, x, curses.ACS_BSBS)
+                x = x + 1
+
+    def write_data_to_pad(self, the_pad):
+        col_widths = self.column_widths()
+        y = 0
+        for r in self._array:
+            x = 0
+            for i in range(0, len(r)):
+                the_pad.addstr(y, x, ('{:' + self._alignment[i] + str(col_widths[i]) + 's}').format(r[i]))
+                x = x + col_widths[i]
+                if i < len(r) - 1:
+                    the_pad.addch(y, x, ' ')
+                    x = x + 1
+                    the_pad.addch(y, x, curses.ACS_SBSB)
+                    x = x + 1
+                    the_pad.addch(y, x, ' ')
+                    x = x + 1
+            y = y + 1
+
+
+class sheet_display(object):
+    """View-and-controller class that coordinates the setup of the curses screen, the display of the data in it, and the event runloop that allows the user to interact with the display."""
+
+    #
+    # This is the static line of text that gets displayed in the control box:
+    #
+    CONTROL_LINE = '[Q]uit   [P]rev/[N]ext page   Page [L]eft/[R]ight   [E]nd/[B]eginning of list'
+    
+    #
+    # Minimum screen dimensions we'll accept:
+    #
+    MIN_H = 8
+    MIN_W = 40
+
+    def __init__(self, screen, sheet):
+        self._screen = screen
+        self._sheet = sheet
+        
+        self.was_resized = False
+        
+        (self._dh, self._dw) = sheet.window_dimension()
+        (self._sh, self._sw) = screen.getmaxyx()
+        
+        #
+        # Verify the screen dimensions:
+        #
+        if self._sw < sheet_display.MIN_W:
+            raise RuntimeError('Terminal width too small for effective use ({:d} x {:d} < {:d} x {:d})'.format(self._sw, self._sh, sheet_display.MIN_W, sheet_display.MIN_H))
+        if self._sh < sheet_display.MIN_H:
+            raise RuntimeError('Terminal height too small for effective use ({:d} x {:d} < {:d x {:d})'.format(self._sw, self._sh,  sheet_display.MIN_W, sheet_display.MIN_H))
+        
+        #
+        # Data pad internal viewport dimension and scroll position:
+        #
+        self._pgh = self._sh - 4
+        self._pgw = self._sw - 2
+        self._sx = 0
+        self._sy = 0
+        
+        #
+        # Create the pads:
+        #
+        self._header_pad = curses.newpad(2, self._dw + 1)
+        self._data_pad = curses.newpad(self._dh, self._dw + 1)
+        self._control_pad = curses.newpad(1, len(sheet_display.CONTROL_LINE) + 1)
+        
+        #
+        # Write data to the pads:
+        #
+        self._sheet.write_header_to_pad(self._header_pad)
+        self._sheet.write_data_to_pad(self._data_pad)
+        self._control_pad.addstr(0, 0, sheet_display.CONTROL_LINE)
+        
+        self._has_screen_been_drawn = False
+
+    def refresh(self):
+        if not self._has_screen_been_drawn:
+            self._screen.clear()
+            self._screen.border()
+            for x in range(1, self._sw - 1):
+                self._screen.addch(self._sh - 3, x, curses.ACS_BSBS)
+            self._screen.refresh()
+            self._has_screen_been_drawn = True
+        
+        self._header_pad.refresh(0,self._sx, 1,1, 2,self._pgw)
+        self._data_pad.refresh(self._sy,self._sx, 3,1, self._pgh,self._pgw)
+        self._control_pad.refresh(0,0, self._sh-2,2, self._sh-2,self._pgw)
+    
+    def runloop(self):
+        is_running = True
+        while not self.was_resized and is_running:
+            self.refresh()
+            no_redraw = True
+            while not self.was_resized and no_redraw:
+                c = stdscr.getch(self._sh-2, 1)
+                if c == curses.KEY_RESIZE:
+                    self.was_resized = True
+                    no_redraw = True
+                    is_running = False
+                elif c == curses.KEY_DOWN:
+                    if self._sy < (self._dh - self._pgh):
+                        self._sy = self._sy + 1
+                        no_redraw = False
+                elif c == curses.KEY_UP:
+                    if self._sy > 0:
+                        self._sy = self._sy - 1
+                        no_redraw = False
+                elif c == curses.KEY_LEFT:
+                    if self._sx > 0:
+                        self._sx = self._sx - 1
+                        no_redraw = False
+                elif c == curses.KEY_RIGHT:
+                    if self._sx < (self._dw - self._pgw):
+                        self._sx = self._sx + 1
+                        no_redraw = False
+                elif c == curses.KEY_SLEFT or c == ord('L') or c == ord('l'):
+                    if self._sx > 0:
+                        self._sx = self._sx - self._pgw
+                        if self._sx < 0: self._sx = 0
+                        no_redraw = False
+                elif c == curses.KEY_SRIGHT or c == ord('R') or c == ord('r'):
+                    if self._sx < (self._dw - self._pgw):
+                        self._sx = self._sx + self._pgw
+                        if self._sx > (self._dw - self._pgw): self._sx = self._dw - self._pgw
+                        no_redraw = False
+                elif c == curses.KEY_NPAGE or c == ord('N') or c == ord('n'):
+                    self._sy = self._sy + self._pgh
+                    if self._sy > (self._dh - self._pgh): self._sy = self._dh - self._pgh
+                    no_redraw = False
+                elif c == curses.KEY_PPAGE or c == ord('P') or c == ord('p'):
+                    self._sy = self._sy - self._pgh
+                    if self._sy < 0: self._sy = 0
+                    no_redraw = False
+                elif c == curses.KEY_BEG or c == ord('B') or c == ord('b'):
+                    if self._sy != 0:
+                        self._sy = 0
+                        no_redraw = False
+                elif c == curses.KEY_END or c == ord('E') or c == ord('e'):
+                    if self._sy != self._dh -  self._pgh:
+                        self._sy = self._dh - self._pgh
+                        no_redraw = False
+                elif c == ord('q') or c == ord('Q'):
+                    is_running = False
+                    no_redraw = False
+            
+#
+# Python 3 really wants us to be sure we're worrying about character
+# encoding when we process the output from a subprocess.  So let's
+# worry about getting the locale setup and find out the default
+# character encoding:
+#
+use_encoding = locale.getpreferredencoding(True)
+if use_encoding is None: use_encoding = 'C'
+
+#
+# Which command are we wrapping?
+#
+wrapped_cmd = os.path.basename(sys.argv[0])
+# Drop the leading 's' character:
+if wrapped_cmd[0] != 's':
+    sys.stderr.write('ERROR:  invalid wrapped command name (no leading "s")\n')
+    exit(errno.EINVAL)
+wrapped_cmd = wrapped_cmd[1:]
+if wrapped_cmd not in valid_wrapped_cmds:
+    sys.stderr.write('ERROR:  invalid wrapped command name ({:s} is not valid})\n'.format(wrapped_cmd))
+    exit(errno.EINVAL)
+
+#
+# Execute the wrapped command:
+#
+cmd_args = [wrapped_cmd]
+cmd_args.extend(added_flags[wrapped_cmd])
+cmd_args.extend(list(filter(lambda s: s not in dropped_flags, sys.argv[1:])))
+try:
+    cmd_process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+    (stdout_text, stderr_text) = cmd_process.communicate()
+    if cmd_process.returncode != 0:
+        sys.stderr.write(stderr_text)
+        exit(cmd_process.returncode)
+except Exception as E:
+    sys.stderr.write('ERROR:  failed to execute {:s}:\n        {:s}'.format(wrapped_cmd, str(E)))
+    exit(1)
+
+#
+# First line on stdout should be the header, then every line after that is
+# a row of data.
+#
+headers = None
+rows = []
+strip_last_col = False
+for line in stdout_text.decode(encoding=use_encoding).splitlines(False):
+    if headers is None:
+        if re.match('^([^\|]*\|)*[^\|]*\|?$', line) is not None:
+            # Found it:
+            headers = line.split('|')
+            if line[-1] == '|':
+                strip_last_col = True
+                headers = headers[:-1]
+    else:
+        row = line.split('|')
+        if strip_last_col:
+            row = row[:-1]
+        rows.append(row)
+if headers is None:
+    sys.stderr.write('ERROR:  could not locate header line in {:s} output\n'.format(wrapped_cmd))
+    exit(1)
+if len(rows) == 0:
+    sys.stdout.write('No data produced by {:s}\n'.format(wrapped_cmd))
+    exit(0)
+
+#
+# Import the data into a sheet and analyze the columns:
+#
+try:
+    data_sheet = sheet(headers=headers, rows=rows)    
+    data_sheet.fixup_alignment()
+except Exception as E:
+    sys.stderr.write('ERROR:  unable to import output from {:s}\n'.format(wrapped_cmd))
+    exit(1)
+
+#
+# Initialize the curses library:
+#
+stdscr = curses.initscr()
+stdscr.clear()
+curses.noecho()
+curses.cbreak()
+stdscr.keypad(1)
+
+#
+# Startup the display and enter its runloop:
+#
+exit_err = None
+try:
+    while True:
+        sheet_screen = sheet_display(stdscr, data_sheet)
+        sheet_screen.runloop()
+        if not sheet_screen.was_resized:
+            break
+except Exception as E:
+    exit_err = str(E)
+#
+# Cleanup and exit from curses control of the terminal:
+#
+stdscr.clear()
+stdscr.refresh()
+curses.nocbreak(); stdscr.keypad(0); curses.echo()
+curses.endwin()
+
+#
+# Did the runloop exit in error?
+#
+if exit_err is not None:
+    sys.stderr.write('ERROR:  failure in sheet runloop:  {:s}\n'.format(exit_err))
+    exit(1)

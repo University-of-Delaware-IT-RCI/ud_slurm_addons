@@ -1287,7 +1287,7 @@ job_submit(
   }
 
   /* Memory limit _must_ be set: */
-  if ( (job_desc->pn_min_memory <= 0) || (job_desc->pn_min_memory == NO_VAL64) ) {
+  if ( job_desc->pn_min_memory == NO_VAL64 ) {
     job_desc->pn_min_memory = udhpc_min_mem_mb | MEM_PER_CPU;
     info(PLUGIN_SUBTYPE ": setting default memory limit (%lu MiB per CPU)", udhpc_min_mem_mb);
   }
