@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <math.h>
 
+#include "slurm/slurm.h"
 #include "slurm/slurm_errno.h"
 #include "src/common/slurm_xlator.h"
 #include "src/common/fd.h"
@@ -34,6 +35,13 @@ const gid_t udhpc_base_gid = UDHPC_BASE_GID;
 # define UDHPC_MIN_MEM_MB       1024
 #endif
 const uint64_t udhpc_min_mem_mb = UDHPC_MIN_MEM_MB;
+
+
+#if (SLURM_VERSION_MAJOR(SLURM_VERSION_NUMBER) > 18 || (SLURM_VERSION_MAJOR(SLURM_VERSION_NUMBER) == 18 && SLURM_VERSION_MINOR(SLURM_VERSION_NUMBER) >= 8))
+# define JOB_DESCRIPTOR_GRES_FIELD      tres_per_node
+#else
+# define JOB_DESCRIPTOR_GRES_FIELD      gres
+#endif
 
 
 #ifndef JOB_SUBMIT_WORKGROUP_TOKEN
@@ -1404,8 +1412,8 @@ job_submit(
   /* If GPUs are requested GRES on this job, then ensure that CPU binding is
    * enforced:
    */
-  if ( job_submit_is_nonempty_str(job_desc->gres) ) {
-    char        *gpu = job_desc->gres;
+  if ( job_submit_is_nonempty_str(job_desc->JOB_DESCRIPTOR_GRES_FIELD) ) {
+    char        *gpu = job_desc->JOB_DESCRIPTOR_GRES_FIELD;
     int         gpu_count = 0;
     
     /* Let's be really nice and try to ensure that socket-per-node is set appropriately
