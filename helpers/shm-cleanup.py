@@ -211,6 +211,7 @@ logging.info('age threshold of %d second(s)', age_threshold)
 # This function does the actual scan-and-cleanup work:
 #
 def do_scan():
+	global cutoff_timestamp, special_cutoff_timestamp
 	#
 	# Scan /dev/shm for all entities with modification timestamps greater than age_threshold
 	# seconds ago:
