@@ -12,7 +12,7 @@ import subprocess
 import re
 import argparse
 
-def parse_tres(tres_str):
+def parse_tres(tres_str, should_total_gres=False):
     resource_limits = dict()
     for kvpair in tres_str.split(','):
         kvpair = kvpair.split('=', 1)
@@ -27,6 +27,12 @@ def parse_tres(tres_str):
             elif m.group(2) == 'P':
                 v = v * 1024 * 1024 * 1024
         resource_limits[kvpair[0]] = v
+        if should_total_gres and (kvpair[0].startswith('gres/') and ':' in kvpair[0]):
+            k = (kvpair[0].split(':'))[0]
+            if k in resource_limits:
+                resource_limits[k] += v
+            else:
+                resource_limits[k] = v
     return resource_limits
 
 #
@@ -71,7 +77,7 @@ sacctmgr_output = sacctmgr_output.split('|')
 if len(sacctmgr_output) < 9 or not sacctmgr_output[8]:
     sys.stderr.write('ERROR:  unable to retrieve resource limits for workgroup ' + argv.group + '\n')
     sys.exit(1)
-resource_limits = parse_tres(sacctmgr_output[8])
+resource_limits = parse_tres(sacctmgr_output[8], should_total_gres=True)
 
 #
 # No limits?

@@ -1,0 +1,291 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# ssheet_driver
+#
+# This multi-tool script looks at the command name to determine what underlying
+# Slurm tool is being wrapped:  "ssqueue" wraps "squeue".  Hard links or symlinks
+# can be used to alias each wrapper to this single driver script.
+#
+# Executes the wrapped command with whatever additional arguments were presented
+# to the wrapper.  All output from the wrapped command is analyzed to make a
+# data array with headers that's then displayed in a scrolling view using the
+# curses library.
+#
+
+import os
+import sys
+import re
+import errno
+import locale
+import subprocess
+import functools
+import argparse
+
+#
+# The commands we can actually wrap:
+#
+valid_wrapped_cmds = ('squeue', 'sinfo', 'sacct', 'sstat', 'sshare')
+
+#
+# If the user provides these flags, drop them from the argument list passed
+# to the original command:
+#
+dropped_flags = ('-h', '--noheader', '--parsable', '--parsable2', '--parseable')
+
+#
+# Add these flags to the wrapped commands to get the expected display format:
+#
+added_flags = {
+        'squeue': ['--parsable'],
+        'sacct': ['--parsable'],
+        'sinfo': ['--parseable'],
+        'sstat': ['--parsable'],
+        'sshare': ['--parsable'],
+    }
+
+
+class sheet(object):
+    """Model class that represents an array (rows x columns) of textual data with column headers.  The class allows rows of data to be dynamically added."""
+
+    def __init__(self, headers=None, rows=None):
+        self._headers = []
+        self._array = []
+        if headers is not None:
+            self.add_headers(headers)
+        if rows is not None:
+            self.add_rows(rows)
+        
+    def __clear_caches(self):
+        self._data_dimension = None
+        self._column_widths = None
+        self._window_dimension = None
+    
+    def add_header(self, header_text):
+        self._headers.append(header_text)
+        self.__clear_caches()
+    
+    def add_headers(self, header_list):
+        self._headers.extend(header_list)
+        self.__clear_caches()
+    
+    def add_row(self, row):
+        r = [str(s) for s in row]
+        self._array.append(r)
+        self.__clear_caches()
+    
+    def add_rows(self, rows):
+        for row in rows:
+            r = [str(s) for s in row]
+            self._array.append(r)
+        self.__clear_caches()
+    
+    def get_headers(self):
+        return iter(self._headers)
+    
+    def get_rows(self):
+        return iter(self._array)
+    
+    def data_dimension(self):
+        if self._data_dimension is None:
+            w = len(self._headers)
+            h = len(self._array)
+        
+            # Is the array wider than the headers?
+            w = max([w, max([ len(s) for s in self._array])])
+
+            self._data_dimension = (h, w)
+        return self._data_dimension
+        
+    def column_widths(self):
+        if self._column_widths is None:
+            (h, w) = self.data_dimension()
+        
+            col_widths = [0]*w
+            for i in range(0, len(self._headers)):
+                col_widths[i] = len(self._headers[i])
+        
+            for row in self._array:
+                for i in range(0, len(row)):
+                    if len(row[i]) > col_widths[i]:
+                        col_widths[i] = len(row[i])
+            self._column_widths = col_widths
+        return self._column_widths
+            
+#
+# Python 3 really wants us to be sure we're worrying about character
+# encoding when we process the output from a subprocess.  So let's
+# worry about getting the locale setup and find out the default
+# character encoding:
+#
+use_encoding = locale.getpreferredencoding(True)
+if use_encoding is None: use_encoding = 'C'
+
+#
+# Which command are we wrapping?
+#
+wrapped_cmd = os.path.basename(sys.argv[0])
+# Drop the leading 'w' character:
+if wrapped_cmd[0] != 'w':
+    sys.stderr.write('ERROR:  invalid wrapped command name (no leading "w")\n')
+    exit(errno.EINVAL)
+wrapped_cmd = wrapped_cmd[1:]
+if wrapped_cmd not in valid_wrapped_cmds:
+    sys.stderr.write('ERROR:  invalid wrapped command name ({:s} is not valid})\n'.format(wrapped_cmd))
+    exit(errno.EINVAL)
+
+#
+# Filter-out our own CLI arguments, leaving just theirs:
+#
+cli_parser = argparse.ArgumentParser(description='Reformat ' + wrapped_cmd + ' output.')
+cli_parser.add_argument('--wrap-format',
+                      dest='wrap_format',
+                      choices=('csv', 'tsv', 'json', 'yaml'),
+                      default='csv',
+                      help='convert the ' + wrapped_cmd + ' output to this format (default: csv)'
+                    )
+cli_parser.add_argument('--wrap-headers-xform',
+                      dest='wrap_headers_xform',
+                      choices=('none', 'lc', 'uc', 'tc'),
+                      default='none',
+                      help='transform column header strings (default: none)'
+                    )
+cli_args, wrapped_args = cli_parser.parse_known_args()
+
+#
+# Execute the wrapped command:
+#
+cmd_args = [wrapped_cmd]
+cmd_args.extend(added_flags[wrapped_cmd])
+cmd_args.extend(list(filter(lambda s: s not in dropped_flags, wrapped_args)))
+try:
+    cmd_process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+    (stdout_text, stderr_text) = cmd_process.communicate()
+    if cmd_process.returncode != 0:
+        sys.stderr.write(stderr_text)
+        exit(cmd_process.returncode)
+except Exception as E:
+    sys.stderr.write('ERROR:  failed to execute {:s}:\n        {:s}'.format(wrapped_cmd, str(E)))
+    exit(1)
+
+#
+# First line on stdout should be the header, then every line after that is
+# a row of data.
+#
+headers = None
+rows = []
+strip_last_col = False
+for line in stdout_text.decode(encoding=use_encoding).splitlines(False):
+    if headers is None:
+        if re.match('^([^\|]*\|)*[^\|]*\|?$', line) is not None:
+            # Found it:
+            headers = line.split('|')
+            if line[-1] == '|':
+                strip_last_col = True
+                headers = headers[:-1]
+    else:
+        row = line.split('|')
+        if strip_last_col:
+            row = row[:-1]
+        rows.append(row)
+if headers is None:
+    sys.stderr.write('ERROR:  could not locate header line in {:s} output\n'.format(wrapped_cmd))
+    exit(1)
+if len(rows) == 0:
+    sys.stdout.write('No data produced by {:s}\n'.format(wrapped_cmd))
+    exit(0)
+
+#
+# Header transforms:
+#
+def xform_lc(s):
+    return s.lower()
+def xform_uc(s):
+    return s.upper()
+def xform_tc(s):
+    return s.title()
+def xform_none(s):
+    return s
+xform_methods = {
+    'lc': xform_lc,
+    'uc': xform_uc,
+    'tc': xform_tc,
+    'none': xform_none,
+}
+
+#
+# Output methods:
+#
+class wrapper_base(object):
+
+    def __init__(self, ds, args):
+        self._ds = ds
+        self._args = args
+    
+    def output(self):
+        pass
+
+class wrapper_csv(wrapper_base):
+    
+    def __init__(self, ds, args):
+        import csv
+        
+        super(wrapper_csv, self).__init__(ds, args)
+        self._writer = csv.writer(sys.stdout)
+        
+    def output(self):
+        d = self._ds.data_dimension()
+    
+        # Do the headers:
+        self._writer.writerow([xform_methods[self._args.wrap_headers_xform](h) for h in self._ds.get_headers()])
+    
+        # Do the data rows:
+        for r in self._ds.get_rows():
+            self._writer.writerow(r)
+
+class wrapper_tsv(wrapper_csv):
+    
+    def __init__(self, ds, args):
+        import csv
+        
+        super(wrapper_csv, self).__init__(ds, args)
+        self._writer = csv.writer(sys.stdout, delimiter='\t')
+        
+class wrapper_json(wrapper_base):
+    def __init__(self, ds, args):
+        d = []
+        h = [xform_methods[args.wrap_headers_xform](h) for h in ds.get_headers()]
+        for r in ds.get_rows():
+            d.append( dict(zip(h, r)) )
+        super(wrapper_json, self).__init__(d, args)
+    
+    def output(self):
+        import json
+        json.dump(self._ds, sys.stdout)
+        
+class wrapper_yaml(wrapper_json):
+
+    def output(self):
+        from yaml import safe_dump
+        safe_dump(self._ds, stream=sys.stdout, encoding=use_encoding, default_flow_style=False)
+
+wrap_methods = {
+    'csv': wrapper_csv,
+    'tsv': wrapper_tsv,
+    'json': wrapper_json,
+    'yaml': wrapper_yaml,
+}
+
+#
+# Import the data into a sheet and analyze the columns:
+#
+try:
+    data_sheet = sheet(headers=headers, rows=rows)
+
+    # All set, let's do the output:
+    w = wrap_methods[cli_args.wrap_format](data_sheet, cli_args)
+    w.output()
+            
+except Exception as E:
+    sys.stderr.write('ERROR:  unable to import output from {:s}\n'.format(wrapped_cmd))
+    exit(1)

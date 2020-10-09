@@ -1,0 +1,319 @@
+#!/usr/bin/env python
+#
+# sbatchnd
+# sbatch helper with job name dependencies
+#
+#
+
+import argparse
+import subprocess
+import sys
+import pwd
+import os
+import errno
+import re
+from fnmatch import fnmatchcase
+
+def parseDependencyOpt(jobLookup, dependencyStr):
+    if dependencyStr == 'singleton': return dependencyStr
+    dependencyList = ''
+    parseRegex = re.compile(r'^(after(|any|burstbuffer|corr|notok|ok)|expand):([^?,]+)(.*)$')
+    while dependencyStr:
+        m = parseRegex.match(dependencyStr)
+        if m is None:
+            raise RuntimeError('invalid dependency dependency_list at: {:s}'.format(dependencyStr))
+        # Head the spec with the type:
+        dependSpec = m.group(1)
+        for jobId in m.group(3).split(':'):
+            if re.match(r'^\d+(\.\d+)?$', jobId) is None:
+                jobId = jobLookup.resolveJobId(jobId)
+                if jobId is None:
+                    exit(errno.EINVAL)
+            dependSpec = dependSpec + ':' + jobId
+        # Append the spec type and job ids:
+        dependencyList = dependencyList + dependSpec
+        dependencyStr = m.group(4).strip()
+        if dependencyStr:
+            if (dependencyStr.startswith(',') or dependencyStr.startswith('?')):
+                dependencyList = dependencyList + dependencyStr[0]
+                dependencyStr = dependencyStr[1:]
+            else:
+                raise RuntimeError('invalid dependency dependency_list at: {:s}'.format(dependencyStr))
+    return dependencyList
+        
+
+class JobIdLookup(object):
+
+    def __init__(self, isVerbose=False, users=None, states=None):
+        #
+        # Ensure squeue is on the path:
+        #
+        try:
+            cmdOutput = subprocess.check_output(['squeue', '--version'])
+            if re.match('^slurm \d+\.\d+\.\d+', cmdOutput) is None:
+                sys.stderr.write('FATAL:  `squeue --version` command did not produce expected output:\n')
+                for line in cmdOutput.splitlines():
+                    sys.stderr.write('        {:s}\n'.format(line))
+                exit(errno.EINVAL)
+        except CalledProcessError as E:
+            sys.stderr.write('FATAL:  squeue command not available in your environment\n')
+            exit(E.returncode)
+        self._flags = []
+        self._isVerbose = isVerbose
+        self._description = ''
+        
+        if users is not None and len(users) > 0:
+            if '*' not in users:
+                self._flags.append('--user=' + ','.join(users))
+                if len(users) > 1:
+                    self._description = 'users ' + ','.join(users)
+                else:
+                    self._description = 'user ' + users[0]
+            else:
+                self._description = 'all users'
+        else:
+            curUid = pwd.getpwuid(os.getuid()).pw_name
+            self._flags.append('--user=' + curUid)
+            self._description = 'user ' + curUid
+            
+        if states is not None and len(states) > 0:
+            self._flags.append('--state=' + ','.join(states))
+            if len(states) > 1:
+                desc = 'states ' + ','.join(states)
+            else:
+                desc = 'state ' + states[0]
+            if self._description:
+                self._description = self._description + ' and ' + desc
+            else:
+                self._description = desc
+                
+    
+    def resolveJobId(self, jobName):
+        # Build command:
+        doFnMatch = False
+        nameDesc = 'name'
+        if '*' in jobName or '?' in jobName or '[' in jobName:
+            doFnMatch = True
+            nameDesc = 'pattern'
+            cmd = ['squeue', '--noheader', '--format=%A,%j']
+        else:
+            cmd = ['squeue', '--noheader', '--format=%A', '--name', jobName]
+        cmd.extend(self._flags)
+        if self._isVerbose:
+            sys.stderr.write('INFO:   job lookup command: {:s}\n'.format(' '.join(cmd)))
+            if doFnMatch: sys.stderr.write('INFO:   names will be matched against pattern `{:s}`\n'.format(jobName))
+        
+        # Execute the command:
+        try:
+            if self._isVerbose: sys.stderr.write('INFO:   executing squeue command\n')
+            cmdExec = subprocess.Popen(cmd, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            (cmdStdout, cmdStderr) = cmdExec.communicate()
+            if self._isVerbose: sys.stderr.write('INFO:   squeue command executed (rc={:d})\n'.format(cmdExec.returncode))
+            
+            if cmdExec.returncode == 0:
+                #
+                # squeue succeeded and possibly returned text on stdout:
+                #
+                lines = cmdStdout.splitlines()
+                if doFnMatch:
+                    #
+                    # Remove lines for which the job name field doesn't match our fnmatch pattern:
+                    #
+                    lines = filter(lambda l: fnmatchcase(l.split(',')[1], jobName), lines)
+                if len(lines) == 1:
+                    #
+                    # Found a single job, hooray!
+                    #
+                    return lines[0].split(',')[0]
+                if len(lines) == 0:
+                    #
+                    # Found no such jobs:
+                    #
+                    if self._description:
+                        sys.stderr.write('ERROR:  no matches for job {:s} `{:s}` for {:s}\n'.format(nameDesc, jobName, self._description))
+                    else:
+                        sys.stderr.write('ERROR:  no matches for job {:s} `{:s}`\n'.format(nameDesc, jobName))
+                else:
+                    #
+                    # Found more than one job, uh-oh:
+                    #
+                    if self._description:
+                        sys.stderr.write('ERROR:  multiple matches for job {:s} `{:s}` for {:s}:\n'.format(nameDesc, jobName, self._description))
+                    else:
+                        sys.stderr.write('ERROR:  multiple matches for job {:s} `{:s}`:\n'.format(nameDesc, jobName))
+                    for line in lines:
+                        sys.stderr.write('        {:s}\n'.format(line))
+            else:
+                #
+                # squeue didn't execute successfully, let the user know what happened:
+                #
+                if self._description:
+                    sys.stderr.write('ERROR:  failure while looking-up job {:s} `{:s}` for {:s}:\n'.format(nameDesc, jobName, self._description))
+                else:
+                    sys.stderr.write('ERROR:  failure while looking-up job {:s} `{:s}`:\n'.format(nameDesc, jobName))
+                for line in cmdStderr.splitlines():
+                    sys.stderr.write('        {:s}\n'.format(line))
+        except Exception as E:
+            #
+            # General failure of subprocess module:
+            #
+            if self._description:
+                sys.stderr.write('ERROR:  failure while looking-up job {:s} `{:s}` for {:s}:\n        {:s}\n'.format(nameDesc, jobName, self._description, str(E)))
+            else:
+                sys.stderr.write('ERROR:  failure while looking-up job {:s} `{:s}`:\n        {:s}\n'.format(nameDesc, jobName, str(E)))
+        return None
+        
+        
+
+cliParser = argparse.ArgumentParser(description='sbatch helper with job name dependencies.', usage='%(prog)s [-h] [--nd-verbose] [--nd-resolve-user <username>]\n        [--nd-resolve-state <state>] [--nd-job-script <path>] [--nd-job-arg <arg#>]\n        {<sbatch options> ...}')
+cliParser.add_argument( '--nd-verbose',
+                        dest='isVerbose',
+                        action='store_true',
+                        default=False,
+                        help='show additional information on stderr')
+cliParser.add_argument( '--nd-resolve-user',
+                        metavar='<username>',
+                        dest='resolveUsers',
+                        action='append',
+                        default=[],
+                        help='only check jobs owned by <username> when resolving job names; may be specified multiple times, by default only the invoking user is checked; a <username> of `*` implies all users')
+cliParser.add_argument( '--nd-resolve-state',
+                        metavar='<state>',
+                        dest='resolveStates',
+                        action='append',
+                        default=[],
+                        help='only check jobs in the given <state> when resolving job names; may be specified multiple times, by default all job states are checked (see `man squeue` for accepted state codes)')
+cliParser.add_argument( '--nd-job-script',
+                        dest='jobScript',
+                        metavar='<path>',
+                        help='resolve all job name --dependency options in <path> and submit the resulting script; `-` may be used to imply a script read from stdin (the default if this flag is not used)')
+cliParser.add_argument( '--nd-job-arg',
+                        dest='jobArgs',
+                        metavar='<arg#>',
+                        action='append',
+                        default=[],
+                        help='positional arguments to the job script; may be used more than once')
+#
+# Parse command line flags:
+#
+cliArgs, unknownArgs = cliParser.parse_known_args()
+        
+#
+# Create our job name resolver object:
+#
+jobLookup = JobIdLookup(isVerbose=cliArgs.isVerbose, users=cliArgs.resolveUsers, states=cliArgs.resolveStates)
+
+#
+# Now we need to scan the job script for dependencies, noting if we find any and
+# prepending them to sbatchOpts:
+#
+dependencyOpts = []
+jobScript = cliArgs.jobScript.trim() if cliArgs.jobScript is not None else '-'
+if not jobScript or jobScript == '-':
+    jobScript = '-'
+    jobScriptFd = sys.stdin
+    doesJobScriptFdNeedClose = False
+else:
+    try:
+        jobScriptFd = open(jobScript, 'r')
+    except Exception as E:
+        sys.stderr.write('ERROR:  unable to read job script `{:s}`:\n        {:s}\n'.format(jobScript, str(E)))
+        exit(errno.ENOENT)
+    doesJobScriptFdNeedClose = True
+#
+# Read the job script:
+#
+jobScriptSrc = ''
+dependencyRegex = re.compile(r'^(.*)(-d\s+|--dependency(=|\s+))(\S+)(.*)$')
+emptySpecLine = re.compile(r'^#SBATCH\s*$')
+for line in jobScriptFd:
+    line = line.rstrip()
+    if line.startswith('#SBATCH'):
+        if cliArgs.isVerbose: sys.stderr.write('INFO:   scanning in-script sbatch options line `{:s}`\n'.format(line))
+        opts = ''
+        while True:
+            m = dependencyRegex.match(line)
+            if m is None:
+                #
+                # Prepend whatever is left...
+                #
+                opts = line + opts
+                break
+            #
+            # Group 4 contains the dependency spec, group 5 the remainder of the line, group 1 the leading bit:
+            #
+            opts = m.group(5) + opts
+            line = m.group(1)
+            try:
+                # Resolve any job names and add to the dependency list:
+                dependencyOpts.append('--dependency=' + parseDependencyOpt(jobLookup, m.group(4)))
+            except Exception as E:
+                sys.stderr.write('ERROR:  {:s}\n'.format(str(E)))                
+        if emptySpecLine.match(opts) is None:
+            if jobScriptSrc:
+                jobScriptSrc = jobScriptSrc + '\n' + opts
+            else:
+                jobScriptSrc = opts
+    else:
+        if jobScriptSrc:
+            jobScriptSrc = jobScriptSrc + '\n' + line
+        else:
+            jobScriptSrc = line
+if doesJobScriptFdNeedClose:
+    close(jobScriptFd)
+    
+if cliArgs.isVerbose:
+    sys.stderr.write('INFO:   job script that will be submitted:\n')
+    for line in jobScriptSrc.splitlines():
+        sys.stderr.write('        {:s}\n'.format(line))
+
+#
+# Now check the sbatchOpts for --dependency flags:
+#
+sbatchOpts = []
+argi = 0
+while argi < len(unknownArgs):
+    arg = unknownArgs[argi]
+    dependency = None
+    if arg == '--dependency' or arg == '-d':
+        # Value is next argument:
+        argi = argi + 1
+        if argi >= len(unknownArgs):
+            sys.stderr.write('ERROR:  no value provided with -d/--dependency option\n')
+            exit(errno.EINVAL)
+        dependency = unknownArgs[argi]
+    elif arg.startswith('--dependency='):
+        # Value attached to flag:
+        dependency = arg[13:]
+    else:
+        sbatchOpts.append(arg)
+    if dependency:
+        try:
+            # Resolve any job names and add to the dependency list:
+            dependencyOpts.append('--dependency=' + parseDependencyOpt(jobLookup, dependency))
+        except Exception as E:
+            sys.stderr.write('ERROR:  {:s}\n'.format(str(E)))
+    argi = argi + 1
+
+#
+# At this point we have the job script and the additional sbatch options
+# all ready.  Summarize and submit:
+#
+cmd = ['sbatch']
+cmd.extend(dependencyOpts)
+cmd.extend(sbatchOpts)
+cmd.append('/dev/stdin')
+cmd.extend(cliArgs.jobArgs)
+if cliArgs.isVerbose: sys.stderr.write('INFO:   executing submission command: {:s}\n'.format(' '.join(cmd)))
+try:
+    submitExec = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (submitStdout, submitStderr) = submitExec.communicate(jobScriptSrc)
+    if submitExec.returncode == 0:
+        sys.stdout.write(submitStdout)
+    else:
+        sys.stderr.write('ERROR:  sbatch did not execute successfully (rc={:d}):\n'.format(submitExec.returncode))
+        for line in submitStderr.splitlines():
+            sys.stderr.write('        {:s}\n'.format(line))
+        exit(submitExec.returncode)
+except Exception as E:
+    sys.stderr.write('ERROR:  general failure executing sbatch command:\n        {:s}\n'.format(str(E)))

@@ -1,0 +1,143 @@
+#!/bin/bash
+#
+# salloc wrapper that starts a VNC session to tunnel to the interactive
+# job then ends it when the job is complete
+#
+
+VNCSERVER_FLAGS=()
+SALLOC_FLAGS=(--x11)
+IS_QUIET=0
+
+function usage {
+    cat <<EOT
+usage:
+
+    $0 [-q|--quiet]
+       [-geometry <width>x<height>] [-name <desktop-name>] [-depth <depth>]
+       [-pixelformat rgbNNN|bgrNNN] [salloc flags]
+
+        -q, --quiet       do not display VNC information as xalloc
+                          executes
+
+    VNC flags:
+
+        -geometry         x- and y-dimension of the virtual display
+        -name             a name for this VNC session
+        -depth            pixel bit depth for the virtual display
+        -pixelformat      byte order and per-component bit depth for
+                          pixels in the virtual display
+
+    salloc flags:
+
+        any flags to be passed to the salloc command
+
+EOT
+}
+
+#
+# Process command line args:
+#
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -q|--quiet)
+            IS_QUIET=1
+            ;;
+        -geometry|-name|-depth|-pixelformat)
+            if [ -z "$2" ]; then
+                echo "ERROR:  no value provided by $1 option"
+                exit 22
+            fi
+            VNCSERVER_FLAGS+=("$1" "$2")
+            shift
+            ;;
+        *)
+            SALLOC_FLAGS+=("$1")
+            ;;
+    esac
+    shift
+done
+
+#
+# Make sure the VNC passwd is setup:
+#
+if [ ! -f ~/.vnc/passwd ]; then
+    cat <<EOT
+WARNING:  VNC requires that you provide a password to protect connection to your
+          VNC sessions.  You will be prompted to create that password now.
+
+EOT
+    vncpasswd
+    RC=$?
+    if [ $RC -ne 0 ]; then
+        exit $RC
+    fi
+    if [ ! -f ~/.vnc/passwd ]; then
+        echo "ERROR:  no (required) passwd file present in your ~/.vnc directory"
+        exit 1
+    fi
+fi
+
+VNCSERVER_OUTPUT="$(vncserver "${VNCSERVER_FLAGS[@]}" 2>&1)"
+RC=$?
+if [ $RC -ne 0 ]; then
+    echo "ERROR:  failed to start VNC session:"
+    echo
+    echo "$VNCSERVER_OUTPUT"
+    exit $RC
+fi
+
+# Figure out the DISPLAY
+VNCDISPLAY_REGEX="desktop is (login0[01]):([0-9]+)"
+if [[ "$VNCSERVER_OUTPUT" =~ $VNCDISPLAY_REGEX ]]; then
+    VNCSERVER_NODE="${BASH_REMATCH[1]}"
+    VNCSERVER_PORT="${BASH_REMATCH[2]}"
+else
+    echo "ERROR:  VNC server startup seems to have failed -- the output was not"
+    echo "        in the expected format:"
+    echo
+    echo "$VNCSERVER_OUTPUT"
+    exit 1
+fi
+
+# Setup error and exit handlers to kill the VNC session:
+function kill_vnc_server {
+    # Kill the VNC server:
+    VNCSERVER_OUTPUT="$(vncserver -kill :${VNCSERVER_PORT} 2>&1)"
+    RC=$?
+    if [ $RC -ne 0 ]; then
+        echo "ERROR:  failed to terminate VNC session:"
+        echo
+        echo "$VNCSERVER_OUTPUT"
+        exit $RC
+    fi
+    if [ $IS_QUIET -eq 0 ]; then
+        echo "INFO:   VNC session ${VNCSERVER_NODE}:${VNCSERVER_PORT} terminated"
+    fi
+}
+trap kill_vnc_server err exit
+
+# Note the VNC session info in the job comment:
+SALLOC_FLAGS+=("--comment=${VNCSERVER_NODE}.caviness.hpc.udel.edu:$((5900+VNCSERVER_PORT))")
+
+# Setup DISPLAY:
+export DISPLAY="${VNCSERVER_NODE}:${VNCSERVER_PORT}.0"
+
+if [ $IS_QUIET -eq 0 ]; then
+    # Show the user what to do:
+    cat <<EOT
+INFO:   The VNC session for this job is present on ${VNCSERVER_NODE}:${VNCSERVER_PORT}
+INFO:   Your ssh tunnel to ${VNCSERVER_NODE}.caviness.hpc.udel.edu should connect to 
+INFO:   port $((5900+VNCSERVER_PORT)):
+INFO:
+INFO:     ssh -L $((5900+VNCSERVER_PORT)):localhost:$((5900+VNCSERVER_PORT)) $(id -un)@${VNCSERVER_NODE}.caviness.hpc.udel.edu
+INFO:
+EOT
+fi
+
+# Go ahead and start the interactive job:
+salloc "${SALLOC_FLAGS[@]}"
+
