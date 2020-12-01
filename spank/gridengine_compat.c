@@ -230,7 +230,7 @@ slurm_spank_task_init(
         spank_setenv(spank_ctxt, "NSLOTS", value, 1);
       }
       if ( snprintf(value, sizeof(value), "%ld", ncpus_per_task) > 0 ) {
-        spank_setenv(spank_ctxt, "OMP_NUM_THREADS", value, 1);
+        /* spank_setenv(spank_ctxt, "OMP_NUM_THREADS", value, 1); */
         spank_setenv(spank_ctxt, "OMP_THREAD_LIMIT", value, 1);
       }
       
@@ -248,7 +248,7 @@ slurm_spank_task_init(
         if ( ncpus_per_task <= 0 ) ncpus_per_task = 1;
       }
       if ( snprintf(value, sizeof(value), "%ld", ncpus_per_task) > 0 ) {
-        spank_setenv(spank_ctxt, "OMP_NUM_THREADS", value, 1);
+        /* spank_setenv(spank_ctxt, "OMP_NUM_THREADS", value, 1); */
         spank_setenv(spank_ctxt, "OMP_THREAD_LIMIT", value, 1);
       }
     }
