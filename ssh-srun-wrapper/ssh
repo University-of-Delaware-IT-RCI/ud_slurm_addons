@@ -1,0 +1,83 @@
+#!/bin/bash
+#
+# Wrapper to srun that behaves like ssh.
+#
+if [ -z "$SLURM_NODELIST" ]; then
+    printf "ERROR: no Slurm nodelist available in environment\n" 1>&2
+    exit 1
+fi
+
+#
+# Parse CLI arguments:
+#
+POSITIONAL=()
+LOG_FILE=""
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        -[1246AaCfGgKkMNnqsTtVvXxYy])
+            # Flag with no argument
+            ;;
+        -[bcDeFIiJLlmOopQRSWw])
+            # Flag with one argument
+            shift
+            ;;
+        -[bcDeFIiJLlmOopQRSWw]?*)
+            # Flag with argument attached
+            ;;
+        -E)
+            # Error file is argument on flag
+            shift
+            LOG_FILE="$1"
+            ;;
+        -E?*)
+            # Error file is attached to the flag
+            LOG_FILE="$(echo "$1" | sed 's/^-e//')"
+            ;;
+        *)
+            POSITIONAL+=("$1") # push to the positional array
+            ;;
+    esac
+    shift
+done
+
+set -- "${POSITIONAL[@]}" # restore positional parameters
+if [ $# -lt 1 ]; then
+    printf "ERROR: no host and command to execute on host\n" 1>&2
+    exit 1
+fi
+
+#
+# First argument should be {<username>@}host:
+#
+if [[ $1 =~ ^(.*@)?(.*)$ ]]; then
+    REMOTE_HOSTNAME="${BASH_REMATCH[2]}"
+else
+    printf "ERROR: invalid remote host specification: %s\n" "$1" 1>&2
+    exit 1
+fi
+shift
+
+#
+# Is the REMOTE_HOSTNAME the name of this host?
+#
+if [ "$REMOTE_HOSTNAME" = "$(/bin/hostname -s)" ]; then
+    #
+    # The remainder of positional arguments are the remote command.
+    #
+    if [ -n "$LOG_FILE" ]; then
+        exec "$@" 2>> "$LOG_FILE"
+    else
+        exec "$@"
+    fi
+else
+    #
+    # The remainder of positional arguments are the remote command.
+    #
+    if [ -n "$LOG_FILE" ]; then
+        exec srun --nodelist="$REMOTE_HOSTNAME" -N1 -n1 -c1 "$@" 2>> "$LOG_FILE"
+    else
+        exec srun --nodelist="$REMOTE_HOSTNAME" -N1 -n1 -c1 "$@"
+    fi
+fi
+

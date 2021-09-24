@@ -1,0 +1,18 @@
+#!/bin/bash
+
+CGROUP_PATH="/sys/fs/cgroup/cpuset$(cat /proc/$$/cgroup | grep cpuset: | cut -d: -f3)/cpuset.cpus"
+printf "step::cpuset:  %s\n" "$(cat "$CGROUP_PATH")"
+
+CGROUP_PATH="/sys/fs/cgroup/memory$(cat /proc/$$/cgroup | grep memory: | cut -d: -f3)"
+printf "step::memory:  %s\n               %s\n" "$(cat "${CGROUP_PATH}/memory.limit_in_bytes")" "$(cat "${CGROUP_PATH}/memory.usage_in_bytes")"
+
+printf "%s\n" "----"
+
+CGROUP_PATH="/sys/fs/cgroup/cpuset$(cat /proc/$$/cgroup | grep cpuset: | cut -d: -f3)"
+CGROUP_PATH="$(dirname "$CGROUP_PATH")"
+printf "job::cpuset:   %s\n" "$(cat "${CGROUP_PATH}/cpuset.cpus")"
+
+CGROUP_PATH="/sys/fs/cgroup/memory$(cat /proc/$$/cgroup | grep memory: | cut -d: -f3)"
+CGROUP_PATH="$(dirname "$CGROUP_PATH")"
+printf "job::memory:   %s\n               %s\n" "$(cat "${CGROUP_PATH}/memory.limit_in_bytes")" "$(cat "${CGROUP_PATH}/memory.usage_in_bytes")"
+
