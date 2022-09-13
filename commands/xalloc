@@ -139,5 +139,5 @@ EOT
 fi
 
 # Go ahead and start the interactive job:
-salloc "${SALLOC_FLAGS[@]}"
+salloc "${SALLOC_FLAGS[@]}" srun --pty --mpi=none --cpu-bind=none ${SHELL:-/bin/bash} -l
 

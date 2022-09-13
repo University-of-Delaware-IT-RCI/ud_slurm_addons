@@ -204,7 +204,7 @@ for jobId in jobIds:
                     if shouldDisplay:
                         foundJobs.append(theJob)
     except Exception as E:
-        print str(E)
+        print(str(E))
 
 # Display what we found:
 if len(foundJobs) > 0:
