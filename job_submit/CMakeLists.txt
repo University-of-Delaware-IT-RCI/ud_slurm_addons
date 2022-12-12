@@ -38,9 +38,7 @@ IF (NOT DISABLE_PRIORITY_ACCESS_QOS)
   SET (DISABLE_PRIORITY_ACCESS_QOS OFF CACHE BOOL "Do not automatically set priority-access QOS on jobs headed to workgroup partitions.")
 ENDIF (NOT DISABLE_PRIORITY_ACCESS_QOS)
 
-IF (NOT SLURM_BUILD_DIR)
-  SET (SLURM_BUILD_DIR "" CACHE PATH "Directory containing the SLURM build (e.g. config.h).")
-ENDIF (NOT SLURM_BUILD_DIR)
+SET (SLURM_BUILD_DIR "" CACHE PATH "Directory containing the SLURM build (e.g. config.h).")
 
 FIND_PATH(SLURM_INCLUDE_DIR NAMES slurm/slurm.h)
 FIND_LIBRARY(SLURM_LIBRARY NAMES libslurm.so)

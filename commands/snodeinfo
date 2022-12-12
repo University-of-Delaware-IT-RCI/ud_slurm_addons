@@ -1,0 +1,304 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import errno
+import subprocess
+import locale
+import argparse
+import json
+try:
+    from yaml import safe_dump
+    has_yaml = True
+except:
+    has_yaml = False
+
+#
+# Python 3 really wants us to be sure we're worrying about character
+# encoding when we process the output from a subprocess.  So let's
+# worry about getting the locale setup and find out the default
+# character encoding:
+#
+use_encoding = locale.getpreferredencoding(True)
+if use_encoding is None: use_encoding = 'C'
+
+
+#
+# These are the fields displayed in "scontrol show nodes" output.
+# The keys are the field name, and the value is a list consisting of:
+#
+#     0:    format specifier (e.g. "s" for string, "d" for integer)
+#     1:    function that converts a string value to the field's native
+#           type (e.g. string to int)
+#     2:    default value for the field
+#     3:    description of field
+#
+fieldFormats = {
+        'NodeName': ['s', lambda V: V, '', 'Node name'],
+        'Arch': ['s', lambda V: V, '', 'System architecture'],
+        'CoresPerSocket': ['d', lambda V: int(V), 0, 'CPU cores per socket'],
+        'CPUAlloc': ['d', lambda V: int(V), 0, 'CPUs in-use'],
+        'CPUErr': ['d', lambda V: int(V), 0, 'CPUs unavail (in error state)'],
+        'CPUTot': ['d', lambda V: int(V), 0, 'Total CPUs on node'],
+        'CPULoad': ['.2f', lambda V: float(V), 0.0, 'Current load on node'],
+        'AvailableFeatures': ['s', lambda V: V, '', 'Possible job contstraint features'],
+        'ActiveFeatures': ['s', lambda V: V, '', 'Available job contstraint features'],
+        'Gres': ['s', lambda V: V, '', 'Generic RESources on node'],
+        'NodeAddr': ['s', lambda V: V, '', 'DNS name or IP address'],
+        'NodeHostName': ['s', lambda V: V, '', 'Official DNS hostname of node'],
+        'Version': ['s', lambda V: V, '', 'Version of slurmd running on node'],
+        'OS': ['s', lambda V: V, '', 'Booted OS on node'],
+        'RealMemory': ['d', lambda V: int(V), 0, 'Total available memory / MiB'],
+        'AllocMem': ['d', lambda V: int(V), 0, 'Memory in-use / MiB'],
+        'FreeMem': ['d', lambda V: int(V), 0, 'Memory not in-use / MiB'],
+        'Sockets': ['d', lambda V: int(V), 0, 'CPU sockets per board'],
+        'Boards': ['d', lambda V: int(V), 0, 'CPU boards per node'],
+        'State': ['s', lambda V: V, '', 'Scheduling state of node'],
+        'ThreadsPerCore': ['d', lambda V: int(V), 0, 'Hardware threads per CPU core'],
+        'TmpDisk': ['d', lambda V: int(V), 0, 'Total available local scratch disk / MiB'],
+        'Weight': ['d', lambda V: int(V), 0, 'Scheduling weight of the node'],
+        'Owner': ['s', lambda V: V, '', ''],
+        'MCS_label': ['s', lambda V: V, '', ''],
+        'Partitions': ['s', lambda V: V, '', 'Slurm partitions spanning the node'],
+        'BootTime': ['s', lambda V: V, '', 'Timestamp of last boot of node'],
+        'SlurmdStartTime': ['s', lambda V: V, '', 'Timestamp of last startup of slurmd on node'],
+        'CfgTRES': ['s', lambda V: V, '', 'Configured Trackable RESources on the node'],
+        'AllocTRES': ['s', lambda V: V, '', 'In-use Trackable RESources on the node'],
+        'CapWatts': ['s', lambda V: V, '', 'Maximum watts of power usable by node'],
+        'CurrentWatts': ['d', lambda V: int(V), 0, 'In-use watts of power by node'],
+        'LowestJoules': ['d', lambda V: int(V), 0, 'Lowest instantaneous energy usage'],
+        'ConsumedJoules': ['d', lambda V: int(V), 0, 'Total energy usage'],
+        'ExtSensorsJoules': ['s', lambda V: V, 0, 'Energy usage from external sensors'],
+        'ExtSensorsWatts': ['d', lambda V: int(V), 0, 'Power usage from external sensors'],
+        'ExtSensorsTemp': ['s', lambda V: V, '', 'Temperature output read by external sensors'],
+        'Reason': ['s', lambda V: V, '', 'Reason for the node being in an exceptional state']
+    }
+#
+# Grab a list of all known field names:
+#
+fieldKeys = fieldFormats.keys()
+#
+# By default these are the fields we display:
+#
+defaultFieldKeys = ['NodeName', 'CPUTot', 'ActiveFeatures', 'RealMemory']
+
+class ShowFieldsAction(argparse.Action):
+    """An argparse action that summarizes the node fields and immediately exits, a'la the build-in help functionality of argparse."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        sys.stderr.write('\nAvailable fields (field names are case-sensitive):\n\n')
+        maxFieldLen = max([len(F) for F in fieldKeys])
+        maxTypeLen = max([len(type(F[2]).__name__) for F in fieldFormats.values()])
+        outputFmt = '    {{:{:d}s}} {{:{:d}s}} {{:s}}\n'.format(maxFieldLen, maxTypeLen)
+        for field in sorted(fieldKeys):
+            sys.stderr.write(outputFmt.format(field, type(fieldFormats[field][2]).__name__, fieldFormats[field][3]))
+        sys.stderr.write('\n')
+        sys.exit(0)
+
+
+
+class SortKey(object):
+    """A SortKey object bundles a field key and a sense of ordering (ascending/descending) and implements a comparator function that can be used in list sorting."""
+
+    def __init__(self, fieldKey, isReverse=None):
+        """Initialize a new sort key specification.  The fieldKey can be suffixed by '+' or nothing to indicate an ascending sort, or '-' to indicate descending.  As an alternative, the isReverse argument can be provided, in which case the ordering is explicitly that."""
+        if fieldKey[-1] in '+-':
+            self.fieldKey = fieldKey[0:-1]
+            self.isReverse = (fieldKey[-1] == '-')
+        else:
+            self.fieldKey = fieldKey
+            self.isReverse = False
+        if self.fieldKey not in fieldKeys:
+            raise ValueError('Unknown field key "{:s}"'.format(fieldKey))
+        if isReverse is not None: self.isReverse = bool(isReverse)
+    
+    def compareNodeInfos(self, N1, N2):
+        """Using the receiver's field key and ordering, compare two node info records.  Returns -1 if ordered ascending, 0 if equivalent, and +1 if ordered descending."""
+        V1 = N1.get(self.fieldKey, fieldFormats[self.fieldKey][2])
+        V2 = N2.get(self.fieldKey, fieldFormats[self.fieldKey][2])
+        if V1 == V2:
+            return 0
+        if V1 < V2:
+            return 1 if self.isReverse else -1
+        return -11 if self.isReverse else 1
+
+
+class NodeInfo(object):
+    """A NodeInfo object wraps a list of dictionaries containing field name-keyed values.  The class implements helper functions for sorting the list and writing a summary to stdout."""
+
+    #
+    # These are the available output modes for the summary:
+    #
+    MODE_TABLE = 'table'
+    MODE_COMPACT = 'compact'
+    MODE_JSON = 'json'
+    MODE_YAML = 'yaml'
+    # The default mode...
+    MODE_DEFAULT = MODE_TABLE
+    # ...with a list of all modes for the sake of argparse's restricting
+    # what the user can type:
+    MODES = (MODE_TABLE, MODE_COMPACT, MODE_JSON, MODE_YAML)
+
+    def __init__(self, mode=MODE_DEFAULT):
+        """Initialize an instance with an empty node list."""
+        self._nodes = []
+    
+    def getNodeCount(self):
+        """Returns the number of nodes in the list."""
+        return len(self._nodes)
+    
+    def getNodeInfo(self, nodeName):
+        """Retrieve the node information for the given NodeName."""
+        nodes = filter(lambda N: N['NodeName'] == nodeName, self._nodes)
+        return [node for node in nodes]
+    
+    def addNodeInfo(self, nodeInfo):
+        """Absorb incoming nodeInfo into the list.  If a record already exists for the incoming NodeName field, then update the existing dictionary with the incoming data."""
+        extantNode = self.getNodeInfo(nodeInfo['NodeName'])
+        self._nodes.append({ k:(fieldFormats[k][1])(v) for (k,v) in nodeInfo.items() })
+        
+    def sortNodeInfo(self, sortSpecs):
+        """Apply a list of zero or more SortKey objects to the node list."""
+        if sortSpecs:
+            def sortCmp(N1, N2):
+                """Sorting proceeds through the list of SortKey objects until one does NOT produce zero (equal) between the objects.  The first non-zero comparator value is returned, or zero if the two records are indisputably equal under the list of SortKey objects."""
+                for sortSpec in sortSpecs:
+                    ordering = sortSpec.compareNodeInfos(N1, N2)
+                    if ordering != 0:
+                        break
+                return ordering
+            self._nodes = sorted(self._nodes, cmp=sortCmp)
+    
+    def writeSummary(self, fields=defaultFieldKeys, mode=MODE_DEFAULT):
+        """Write a summary of the node info records to stdout.  The information is output according to the output mode and is limited to the given list of field names."""
+        if fields is None:
+            altFieldNames = set()
+            for node in self._nodes:
+                altFieldNames.update(node.keys())
+            altFieldNames.remove('NodeName')
+            fieldNames = ['NodeName']
+            fieldNames.extend(sorted(altFieldNames))
+        else:
+            fieldNames = fields
+        if mode in (NodeInfo.MODE_JSON, NodeInfo.MODE_YAML):
+            #
+            # JSON and YAML modes allow a list of dictionaries to be exported
+            # directly:
+            #
+            if fields is None:
+                node = self._nodes
+            else:
+                nodes = [{k:v for (k,v) in N.items() if k in fieldNames} for N in self._nodes]
+            if mode == NodeInfo.MODE_YAML:
+                safe_dump(nodes, stream=sys.stdout,
+                        encoding=use_encoding, default_flow_style=False)
+            elif mode == NodeInfo.MODE_JSON:
+                json.dump(nodes, sys.stdout)
+        elif mode == NodeInfo.MODE_TABLE:
+            # Calculate maximum field width for each field:
+            widths = [len(f) for f in fieldNames]
+            for node in self._nodes:
+                widths = [max(v1, v2) for (v1, v2) in zip(widths, [len(('{:'+fieldFormats[f][0]+'}').format(node.get(f, fieldFormats[f][2]))) for f in fieldNames])]
+            
+            # Construct the format string:
+            printFmt = ' '.join(['{:'+str(w)+'s}' for (w) in widths])
+            print(printFmt.format(*fieldNames))
+            printFmt = ' '.join(['{0:'+str(w)+'.'+str(w)+'s}' for (w) in widths])
+            print(printFmt.format('-'*max(widths)))
+            printFmt = ' '.join(['{:'+str(w)+fieldFormats[f][0]+'}' for (w,f) in zip(widths, fieldNames)])
+            for node in self._nodes:
+                print(printFmt.format(*[node.get(f, fieldFormats[f][2]) for f in fieldNames]))
+        elif mode == NodeInfo.MODE_COMPACT:
+            print('|'.join(fieldNames))
+            printFmt = '|'.join(['{:'+f[0]+'}' for f in [fieldFormats[F] for F in fieldNames]])
+            for node in self._nodes:
+                print(printFmt.format(*[node.get(f, fieldFormats[f][2]) for f in fieldNames]))
+                
+        
+
+cliParser = argparse.ArgumentParser(description='Formatted display of Slurm node information')
+cliParser.add_argument('--mode', '-m', metavar='<mode>',
+                    dest='mode',
+                    choices=NodeInfo.MODES,
+                    default=NodeInfo.MODE_DEFAULT,
+                    help='Output mode; default "{:s}", available {:s}'.format(NodeInfo.MODE_DEFAULT, ' '.join(['"{:s}"'.format(M) for M in NodeInfo.MODES]))
+                )
+cliParser.add_argument('--fields', '-f', metavar='<fieldlist>',
+                    dest='fields',
+                    action='append',
+                    help='Comma-separated list of field names to include in the summary, use the "--help-fields" flag to get a list; default is ' + ','.join(defaultFieldKeys)
+                )
+cliParser.add_argument('--sort', '-s', metavar='<sortlist>',
+                    dest='sortList',
+                    action='append',
+                    help='Comma-separated list of field names (with optional suffix "+" for ascending, "-" for descending) to progressively sort the node list' 
+                )
+cliParser.add_argument('--help-fields',
+                    nargs=0,
+                    action=ShowFieldsAction,
+                    help='Show a summary of available fields.'
+                )
+cliArgs = cliParser.parse_args()
+
+# Prep the display fields:
+if cliArgs.fields is None:
+    displayFields = defaultFieldKeys
+else:
+    displayFields = []
+    for fieldList in cliArgs.fields:
+        newFields = fieldList.split(',')
+        badFields = filter(lambda F: F not in fieldKeys, newFields)
+        if len(badFields) > 0:
+            sys.stderr.write('ERROR:  unknown fieldname: {:s}\n'.format(badFields[0]))
+            sys.exit(errno.EINVAL)
+        displayFields.extend(newFields)
+
+# Prep the sort fields:
+if cliArgs.sortList is None:
+    sortKeys = None
+else:
+    sortKeys = []
+    try:
+        for sortKeyList in cliArgs.sortList:
+            sortKeys.extend([SortKey(S) for S in sortKeyList.split(',')])
+    except ValueError as E:
+        sys.stderr.write('ERROR:  {:s}\n'.format(str(E)))
+        sys.exit(errno.EINVAL)
+
+# Process the node information from scontrol:
+nodeInfoCmd = subprocess.Popen(
+                    ['scontrol', 'show', 'nodes'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+(nodeInfoStdout, nodeInfoStderr) = nodeInfoCmd.communicate()
+if nodeInfoCmd.returncode != 0:
+    sys.stderr.write('ERROR:  failed to retrieve node info via scontrol')
+    sys.stderr.write(nodeInfoStderr)
+    sys.exit(nodeInfoCmd.returncode)
+
+# Parse the output and populate a NodeInfo object:
+nodeInfoList = NodeInfo()
+accumulatedFields = {}
+for nodeLine in nodeInfoStdout.splitlines():
+    nodeLine = nodeLine.strip()
+    if nodeLine:
+        if 'NodeName=' in nodeLine:
+            if 'NodeName' in accumulatedFields:
+                nodeInfoList.addNodeInfo(accumulatedFields)
+            accumulatedFields = {}
+        if nodeLine.count('=') > 1:
+            for fieldText in nodeLine.split():
+                (fieldKey, fieldValue) = fieldText.split('=', 1)
+                accumulatedFields[fieldKey] = fieldValue
+        else:
+            (fieldKey, fieldValue) = nodeLine.split('=', 1)
+            accumulatedFields[fieldKey] = fieldValue
+# Don't forget that last node we were accumulating...
+if 'NodeName' in accumulatedFields:
+    nodeInfoList.addNodeInfo(accumulatedFields)
+
+# Sort the list:
+nodeInfoList.sortNodeInfo(sortKeys)
+
+# Write the summary to stout:
+nodeInfoList.writeSummary(mode=cliArgs.mode, fields=displayFields)

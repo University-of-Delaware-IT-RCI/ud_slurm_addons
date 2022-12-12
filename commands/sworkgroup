@@ -12,7 +12,12 @@ import grp
 import subprocess
 import argparse
 
-SLURM_PREFIX = '/opt/shared/slurm/bin'
+# Look at the command issued -- can we infer the prefix from it?
+SLURM_PREFIX = '/opt/shared/slurm/'
+if sys.argv[0].startswith(SLURM_PREFIX):
+    SLURM_PREFIX = os.path.dirname(sys.argv[0])
+else:
+    SLURM_PREFIX = os.path.join(SLURM_PREFIX, 'bin')
 
 cached_qos_defs = {}
 def get_qos_definition(qos_name):
