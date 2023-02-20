@@ -288,9 +288,11 @@ def do_scan():
 	# present under /dev/shm that aren't in use :-\
 	#
 	try:
-		lsof_process = subprocess.Popen(['/usr/sbin/lsof', '-lnP', '+D', '/dev/shm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		lsof_bin = "/usr/bin/lsof"
+		lsof_process = subprocess.Popen([lsof_bin, '-lnP', '+D', '/dev/shm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	except Exception as E:
-		logging.error(str(E))
+		log_msg = "Popen of "+str(lsof_bin)+" Failed "+str(E);
+		logging.error(log_msg)
 		sys.exit(1)
 
 	#
