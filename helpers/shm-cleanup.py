@@ -220,8 +220,8 @@ def do_scan():
 	special_cutoff_timestamp = time.time() - special_cutoff_threshold
 	logging.info('cutoff timestamp for modification timestamps, standard: %d', cutoff_timestamp)
 	logging.info('cutoff timestamp for modification timestamps, specials: %d', special_cutoff_timestamp)
-	include_shm_entities = sets.Set()
-	exclude_shm_entities = sets.Set()
+	include_shm_entities = set()
+	exclude_shm_entities = set()
 	for root_dir, dirs, files in os.walk('/dev/shm', topdown=False):
 		# Check files:
 		for file in files:
@@ -288,18 +288,16 @@ def do_scan():
 	# present under /dev/shm that aren't in use :-\
 	#
 	try:
-		lsof_bin = "/usr/bin/lsof"
-		lsof_process = subprocess.Popen([lsof_bin, '-lnP', '+D', '/dev/shm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		lsof_process = subprocess.Popen(['/usr/bin/lsof', '-lnP', '+D', '/dev/shm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	except Exception as E:
-		log_msg = "Popen of "+str(lsof_bin)+" Failed "+str(E);
-		logging.error(log_msg)
+		logging.error(str(E))
 		sys.exit(1)
 
 	#
 	# We only want to check the stdout from lsof.  Scan first-level
 	# paths into a set.
 	#
-	inuse_shm_entities = sets.Set()
+	inuse_shm_entities = set()
 	while True:
 		line = lsof_process.stdout.readline()
 		if line != b'':
