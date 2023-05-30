@@ -49,6 +49,15 @@ const uint64_t udhpc_min_mem_mb = UDHPC_MIN_MEM_MB;
 #endif
 const char *udhpc_workgroup_token = JOB_SUBMIT_WORKGORUP_TOKEN;
 
+const char *udhpc_gpu_types[] = {
+        ":p100",
+        ":v100",
+        ":t4",
+        ":a100",
+        ":a40",
+        NULL
+    };
+
 char*
 job_submit_getgrgid(
   gid_t           the_gid
@@ -1423,7 +1432,17 @@ job_submit(
       /* Skip past the "gpu" string: */
       gpu += 3;
       if ( *gpu == ':' ) {
-        if ( xstrncasecmp(":p100", gpu, 5) == 0 ) gpu += 5;
+        const char   **subtype = udhpc_gpu_types;
+
+        /* Check for sub-types: */
+        while ( *subtype ) {
+            size_t   subtype_len = strlen(*subtype);
+            if ( xstrncasecmp(*subtype, gpu, subtype_len) == 0 ) {
+                gpu += subtype_len;
+                break;
+            }
+            subtype++;
+        }
         if ( *gpu == ':' ) gpu++;
         /* What should follow is an integer, comma, or end of string: */
         switch ( *gpu ) {

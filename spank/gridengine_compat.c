@@ -161,7 +161,7 @@ slurm_spank_task_init(
 )
 {
   char          value[8192];
-  long          ntasks = 1, ncpus_per_task = 1;
+  long          ntasks = 1, ncpus_per_task = 1, ncpus_on_node;
   
   if ( spank_remote(spank_ctxt) ) {
     if ( should_add_sge_env ) {
@@ -251,6 +251,19 @@ slurm_spank_task_init(
         /* spank_setenv(spank_ctxt, "OMP_NUM_THREADS", value, 1); */
         spank_setenv(spank_ctxt, "OMP_THREAD_LIMIT", value, 1);
       }
+    }
+
+    ncpus_on_node = 1;
+
+    /* Always set PSM2_MAX_CONTEXTS_PER_JOB */
+    if ( spank_getenv(spank_ctxt, "SLURM_CPUS_ON_NODE", value, sizeof(value)) == ESPANK_SUCCESS && *value ) {
+      ncpus_on_node = strtol(value, NULL, 10);
+      if ( ncpus_on_node <= 0 ) ncpus_on_node = 1;
+    }
+    if ( snprintf(value, sizeof(value), "%ld", ncpus_on_node) > 0 ) {
+      spank_setenv(spank_ctxt, "PSM2_MAX_CONTEXTS_PER_JOB", value, 1);
+    } else {
+      spank_setenv(spank_ctxt, "PSM2_MAX_CONTEXTS_PER_JOB", "1", 1);
     }
   }
   return (0);
