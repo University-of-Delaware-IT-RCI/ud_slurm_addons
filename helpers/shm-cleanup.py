@@ -40,11 +40,25 @@ import time
 import sets
 import subprocess
 
+try:
+	test_set = set()
+	def newSet():
+		return set()
+except:
+	try:
+		import sets
+		def newSet():
+			return sets.Set()
+	except:
+		sys.stdout.write('FATAL ERROR:  no set class available in this Python interpreter\n')
+		sys.exit(1)
+
 #
 ##
 #
 
-firstLevelDevShmRegex = re.compile(r'(/dev/shm/[^/]+)')
+# Will get set after CLI args are processed:
+firstLevelDevShmRegex = None
 
 def firstLevelDevShmPath(path):
 	m = firstLevelDevShmRegex.match(path)
@@ -132,6 +146,14 @@ cli_parser.add_argument('-n', '--dry-run',
 		default=False, action='store_true', dest='is_dry_run',
 		help='do not remove any files, just display what would be done; this option sets the base verbosity level to INFO (as in -vv)'
 	)
+cli_parser.add_argument('--dev-shm-prefix', '-P', metavar='<path>',
+		default='/dev/shm', dest='dev_shm_prefix',
+		help='mountpoint of the shm file system (default: /dev/shm)'
+	)
+cli_parser.add_argument('--lsof', '-L', metavar='<cmd>',
+		default='lsof', dest='lsof',
+		help='path to the lsof command; if the value is a bare command (not a path) then lsof commands are executed in a shell (default: lsof)'
+	)
 cli_parser.add_argument('--show-log-timestamps', '-t',
 		default=False, action='store_true', dest='show_log_timestamps',
 		help='display timestamps on all messages logged by this program'
@@ -192,6 +214,16 @@ else:
 		)
 
 #
+# Validate the shm directory prefix:
+#
+dev_shm_prefix = os.path.realpath(cli_args.dev_shm_prefix)
+if not os.path.isdir(dev_shm_prefix):
+	logging.critical('shm prefix path "{:s}" does not exist'.format(cli_args.dev_shm_prefix))
+	sys.exit(1)
+# Generate the regex:
+firstLevelDevShmRegex = re.compile('({:s}/[^/]+)'.format(dev_shm_prefix))
+
+#
 # No special treatment?
 #
 if cli_args.is_special_treatment_disabled:
@@ -210,7 +242,7 @@ logging.info('age threshold of %d second(s)', age_threshold)
 #
 # This function does the actual scan-and-cleanup work:
 #
-def do_scan():
+def do_scan(dev_shm_prefix, lsof):
 	global cutoff_timestamp, special_cutoff_timestamp
 	#
 	# Scan /dev/shm for all entities with modification timestamps greater than age_threshold
@@ -220,9 +252,9 @@ def do_scan():
 	special_cutoff_timestamp = time.time() - special_cutoff_threshold
 	logging.info('cutoff timestamp for modification timestamps, standard: %d', cutoff_timestamp)
 	logging.info('cutoff timestamp for modification timestamps, specials: %d', special_cutoff_timestamp)
-	include_shm_entities = sets.Set()
-	exclude_shm_entities = sets.Set()
-	for root_dir, dirs, files in os.walk('/dev/shm', topdown=False):
+	include_shm_entities = newSet()
+	exclude_shm_entities = newSet()
+	for root_dir, dirs, files in os.walk(dev_shm_prefix, topdown=False):
 		# Check files:
 		for file in files:
 			p = os.path.join(root_dir, file)
@@ -233,7 +265,7 @@ def do_scan():
 		# Once we get to /dev/shm, scan the directories, too; but we
 		# don't let a directory's timestamp being newer exclude it from
 		# being removed -- only child files can do that:
-		if root_dir == '/dev/shm':
+		if root_dir == dev_shm_prefix:
 			for dir in dirs:
 				p = os.path.join(root_dir, dir)
 				if devShmPathShouldInclude(p):
@@ -273,13 +305,13 @@ def do_scan():
 				logging.info('  PSM2 segments:           %8d', psm_count)
 				logging.info('  Open MPI vader segments: %8d', vader_count)
 
-	summarizeDevShmEntitySet(include_shm_entities, 'removable first-level entities under /dev/shm')
+	summarizeDevShmEntitySet(include_shm_entities, 'removable first-level entities under ' + dev_shm_prefix)
 
 	#
 	# Make sure we're running as root:
 	#
 	if os.getuid() != 0:
-		logging.critical('scanning for active /dev/shm files requires root privileges')
+		logging.critical('scanning for active {:s} files requires root privileges'.format(dev_shm_prefix))
 		sys.exit(1)
 
 	#
@@ -288,7 +320,13 @@ def do_scan():
 	# present under /dev/shm that aren't in use :-\
 	#
 	try:
-		lsof_process = subprocess.Popen(['/usr/sbin/lsof', '-lnP', '+D', '/dev/shm'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		cmd_seq = [lsof, '-lnP', '+D', dev_shm_prefix]
+		if os.sep in lsof:
+			logging.debug('performing lsof command "{:s}"'.format(' '.join(cmd_seq)))
+			lsof_process = subprocess.Popen(cmd_seq, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		else:
+			logging.debug('performing lsof command "{:s}" in a shell'.format(' '.join(cmd_seq)))
+			lsof_process = subprocess.Popen(' '.join(cmd_seq), stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
 	except Exception as E:
 		logging.error(str(E))
 		sys.exit(1)
@@ -297,7 +335,7 @@ def do_scan():
 	# We only want to check the stdout from lsof.  Scan first-level
 	# paths into a set.
 	#
-	inuse_shm_entities = sets.Set()
+	inuse_shm_entities = newSet()
 	while True:
 		line = lsof_process.stdout.readline()
 		if line != b'':
@@ -311,14 +349,14 @@ def do_scan():
 	#
 	# Count and summarize how many items we see in-use:
 	#
-	summarizeDevShmEntitySet(inuse_shm_entities, 'in-use first-level entities under /dev/shm')
+	summarizeDevShmEntitySet(inuse_shm_entities, 'in-use first-level entities under ' + dev_shm_prefix)
 
 	#
 	# The set difference gives us what we need to remove:
 	#
 	remove_shm_entities = include_shm_entities - inuse_shm_entities
 	if len(remove_shm_entities) < len(include_shm_entities):
-		summarizeDevShmEntitySet(remove_shm_entities, 'first-level entities under /dev/shm to be removed')
+		summarizeDevShmEntitySet(remove_shm_entities, 'first-level entities under {:s} to be removed'.format(dev_shm_prefix))
 
 	if len(remove_shm_entities) > 0:
 		#
@@ -338,7 +376,7 @@ def do_scan():
 				except Exception as E:
 					logging.info('  FAIL rm -rf %s : %s', p, str(E))
 	else:
-		logging.warning('nothing to be removed from /dev/shm')
+		logging.warning('nothing to be removed from ' + dev_shm_prefix)
 
 
 #
@@ -400,7 +438,7 @@ if cli_args.is_daemon:
 	#
 	try:
 		while True:
-			do_scan()
+			do_scan(dev_shm_prefix, cli_args.lsof)
 			time.sleep(daemon_period)
 	except:
 		pass
@@ -414,4 +452,4 @@ else:
 	#
 	# Single run only:
 	#
-	do_scan()
+	do_scan(dev_shm_prefix, cli_args.lsof)
