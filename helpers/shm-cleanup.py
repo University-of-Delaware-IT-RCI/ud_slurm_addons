@@ -339,7 +339,7 @@ def do_scan(dev_shm_prefix, lsof):
 	while True:
 		line = lsof_process.stdout.readline()
 		if line != b'':
-			m = firstLevelDevShmRegex.search(line.strip())
+			m = firstLevelDevShmRegex.search(str(line).strip())
 			if m:
 				inuse_shm_entities.add(m.group(1))
 		else:
