@@ -102,7 +102,8 @@ devShmPathShouldInclude = devShmPathShouldInclude_SpecialTreatment
 
 def recursiveRm(path):
 	try:
-		rm_process = subprocess.Popen(['rm', '-rf', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		rm_process = subprocess.Popen(['rm', '-rf', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+					      universal_newlines=True)
 		(rm_stdout, rm_stderr) = rm_process.communicate()
 		if rm_process.returncode != 0:
 			raise RuntimeError('failed to remove ' + path + ': ' + rm_stderr.replace('\n', '; '))
@@ -323,10 +324,12 @@ def do_scan(dev_shm_prefix, lsof):
 		cmd_seq = [lsof, '-lnP', '+D', dev_shm_prefix]
 		if os.sep in lsof:
 			logging.debug('performing lsof command "{:s}"'.format(' '.join(cmd_seq)))
-			lsof_process = subprocess.Popen(cmd_seq, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			lsof_process = subprocess.Popen(cmd_seq, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+						       universal_newlines=True)
 		else:
 			logging.debug('performing lsof command "{:s}" in a shell'.format(' '.join(cmd_seq)))
-			lsof_process = subprocess.Popen(' '.join(cmd_seq), stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+			lsof_process = subprocess.Popen(' '.join(cmd_seq), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+							shell=True, universal_newlines=True)
 	except Exception as E:
 		logging.error(str(E))
 		sys.exit(1)
@@ -338,7 +341,7 @@ def do_scan(dev_shm_prefix, lsof):
 	inuse_shm_entities = newSet()
 	while True:
 		line = lsof_process.stdout.readline()
-		if line != b'':
+		if line != '':
 			m = firstLevelDevShmRegex.search(line.strip())
 			if m:
 				inuse_shm_entities.add(m.group(1))
